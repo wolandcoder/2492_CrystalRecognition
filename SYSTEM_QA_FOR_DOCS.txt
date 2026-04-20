@@ -1,0 +1,67 @@
+1) Какие алгоритмы используются для сегментации кристаллов?
+Сегментация реализована в моде __particle_centers и построена как multi-stage pipeline на OpenCV:
+- Нормализация контраста: CLAHE + Gaussian blur.
+- Детекция светлых зон: adaptive threshold + fixed threshold + Canny + fill замкнутых контуров.
+- Детекция теплых/бронзовых зон: HSV-маска по H/S/V диапазонам.
+- Объединение масок: bright OR warm.
+- Подавление фона: фоновая модель EMA (accumulateWeighted) + порог по absdiff.
+- Морфология: open/close, локально erode/dilate для разрыва тонких перемычек.
+- Разделение слипшихся элементов: distance transform + watershed (по локальным пикам/threshold), затем fallback k-means split для больших blob.
+- Фильтрация кандидатов: площадь, solidity, aspect ratio, extent, локальный контраст и внутренняя дисперсия.
+- NMS и межкадровый трекинг для стабилизации.
+
+2) Какие алгоритмы используются для определения ориентации?
+Ориентация определяется в моде __particle_centers так:
+- Базово: minAreaRect.
+- Для более вытянутых контуров: fitEllipse (если доступно).
+- Затем межкадровое сглаживание угла в треке через EMA в пространстве sin/cos для угла*2 (корректно для цикличности 180 градусов).
+- Внезапные скачки угла отбрасываются по порогу разницы (outlier rejection).
+
+3) Где хранятся параметры калибровки?
+Основные параметры калибровки координатной плоскости хранятся в config.json, секция particle_grid:
+- scale_x, scale_y
+- unit
+- origin_offset_x, origin_offset_y
+- invert_y
+
+Для мода ближайшего элемента (__particle_centers_nearest) визуальные параметры хранятся в секции particle_nearest.
+
+4) -
+
+5) Как происходит взаимодействие с камерой?
+Библиотека cv2 (OpenCV)
+Через абстракцию VideoSource:
+- CameraVideoSource открывает cv2.VideoCapture(camera_index).
+- На каждом шаге вызывается read() и возвращается FrameResult(ok, frame).
+- Viewer крутит цикл: read -> neural mods -> imshow.
+- Выход: Esc или окончание потока.
+
+6) Какая библиотека используется для захвата видео?
+OpenCV (cv2), класс VideoCapture.
+
+7) Как запустить систему с нуля?
+Шаги:
+1. Создать и активировать venv.
+2. Установить зависимости из requirements.txt.
+3. Настроить источник:
+   python3 main.py init
+   или вручную:
+   python3 main.py source camera --index 0
+   либо
+   python3 main.py source file --path "/path/to/video.mp4" --loop true
+4. Запустить просмотр:
+   python3 main.py view
+
+8) Какие параметры можно настраивать?
+Через config.json:
+- source.type (camera/file), source.camera.index, source.file.path, source.file.loop
+- window.title
+- neural.mods (порядок и список активных модов)
+- particle_centers: цвета оверлея
+- particle_grid: масштаб/единицы/смещения/инверсия оси Y/стиль сетки и подписей
+- particle_nearest: цвета и стиль выделения ближайшего top-элемента
+
+9) Где хранятся конфиги?
+Главный конфиг: config.json в корне проекта.
+Часть полей (source/window/neural) читает и сохраняет ConfigService.
+Важно: секции модов (particle_centers, particle_grid, particle_nearest) сейчас читаются самими модами напрямую из config.json.
