@@ -1,9 +1,15 @@
 import time
+<<<<<<< HEAD
 from mach3_common import MyData, Connection, ColbaConfig
+=======
+import socket
+from mach3_common import MyData, generate_gcode, send_command_string, send_object
+>>>>>>> hse/main
 
 DEFAULT_IP = '192.168.1.125'
 DEFAULT_PORT = 5555
 
+<<<<<<< HEAD
 # создание обекта где будут хранится все данные (тут используется конструктор сразу с ip и портом, можно без него)
 data = MyData(ip=DEFAULT_IP, port=DEFAULT_PORT)
 
@@ -89,3 +95,18 @@ data.motion.set_command(None)    # чтобы сгенерировать G-ко�
 data.motion.send(expect_response=False)
 # Снова обновляем координаты
 data.motion.get_DRO()
+=======
+
+data = MyData(ip=DEFAULT_IP, port=DEFAULT_PORT)
+data.motion.get_DRO(data.connection) #Обновляет все координаты
+
+# data.motion.send_command("zerotozond")
+
+data.motion.move_on("y",-1,data.connection)
+
+# data.motion.set_x(40)
+# send_command_string(data, False) #false - без ответа
+
+data.motion.get_DRO(data.connection) #обновить все координаты
+x = data.motion._X
+>>>>>>> hse/main

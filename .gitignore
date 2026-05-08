@@ -1,10 +1,14 @@
+<<<<<<< HEAD
 # ── Python ────────────────────────────────────────────────────────────────────
+=======
+>>>>>>> hse/main
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.so
 *.dylib
+<<<<<<< HEAD
 
 # ── Виртуальное окружение ─────────────────────────────────────────────────────
 .venv/
@@ -38,10 +42,32 @@ Desktop.ini
 
 # ── Видеофайлы и тестовые записи ─────────────────────────────────────────────
 VIDEOS_TESTS/
+=======
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.cursor/
+.vscode/
+.idea/
+.flet/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.temp
+VIDEOS_TESTS/
+assets/
+>>>>>>> hse/main
 *.mp4
 *.avi
 *.mov
 *.mkv
+<<<<<<< HEAD
 *.MOV
 
 # ── Захваченные кадры (создаются в рантайме через GUI) ───────────────────────
@@ -50,3 +76,7 @@ captures/
 # ── Node.js (девинструменты, если вернутся) ───────────────────────────────────
 node_modules/
 package-lock.json
+=======
+README*
+*.md
+>>>>>>> hse/main
