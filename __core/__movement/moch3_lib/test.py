@@ -15,7 +15,7 @@ data.motion.set_connection(Connection('192.168.1.100', 5556))
 # ==================== тут инфа про рабочую зону
 # можно сделать обект колба и просто передаьт его в наш обект хранения координат
 colba = ColbaConfig(x=0.0, y=0.0, r=40.0, h=10.0)
-data.motion.colb-information = colba
+data.motion.colba_information = colba
 
 # или просто использовать сеттер, можно стетать по 1 координате
 data.motion.set_colba_params(x=0.0, y=0.0, r=40.0, h=10.0)

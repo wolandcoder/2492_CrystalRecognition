@@ -259,7 +259,7 @@ class Motion:
         self._f = None
         self._command = None
         self._manual_command = None
-        self._colb-information = colba if colba is not None else self.DEFAULT_COLBA
+        self._colba_information = colba if colba is not None else self.DEFAULT_COLBA
 
     # --- Свойства для чтения ---
     @property
@@ -291,14 +291,14 @@ class Motion:
         return self._manual_command
 
     @property
-    def colb-information(self):
-        return self._colb-information
+    def colba_information(self):
+        return self._colba_information
 
-    @colb-information.setter
-    def colb-information(self, value: ColbaConfig):
+    @colba_information.setter
+    def colba_information(self, value: ColbaConfig):
         if not isinstance(value, ColbaConfig):
-            raise TypeError("colb-information must be ColbaConfig instance")
-        self._colb-information = value
+            raise TypeError("colba_information must be ColbaConfig instance")
+        self._colba_information = value
 
     @property
     def connection(self) -> Connection:
@@ -445,13 +445,13 @@ class Motion:
 
     def set_colba_params(self, x=None, y=None, r=None, h=None):
         if x is not None:
-            self._colb-information.x = x
+            self._colba_information.x = x
         if y is not None:
-            self._colb-information.y = y
+            self._colba_information.y = y
         if r is not None:
-            self._colb-information.r = r
+            self._colba_information.r = r
         if h is not None:
-            self._colb-information.h = h
+            self._colba_information.h = h
         return self
 
     def clear(self):
@@ -468,11 +468,11 @@ class Motion:
             return
 
         # Получаем актуальные координаты со станка
-        temp = Motion(connection=self._connection, colba=self._colb-information)
+        temp = Motion(connection=self._connection, colba=self._colba_information)
         temp.get_DRO()
         current_z = temp.Z
 
-        colba = self._colb-information
+        colba = self._colba_information
         if current_z is None or colba.h is None or colba.r is None:
             return
 
@@ -743,13 +743,13 @@ class Motion:
         if not self._connection:
             return False
 
-        temp = Motion(connection=self._connection, colba=self._colb-information)
+        temp = Motion(connection=self._connection, colba=self._colba_information)
         temp.get_DRO()
         current_z = temp.Z
         if current_z is None:
             return False
 
-        colba = self._colb-information
+        colba = self._colba_information
         if colba.h is None or colba.r is None:
             return False
 
@@ -766,7 +766,7 @@ class Motion:
     def __repr__(self):
         return (f"Motion(X={self._X}, Y={self._Y}, Z={self._Z}, A={self._A}, "
                 f"f={self._f}, command='{self._command}', manual='{self._manual_command}', "
-                f"colba={self._colb-information}, connection={self._connection})")
+                f"colba={self._colba_information}, connection={self._connection})")
 
 
 class MyData:

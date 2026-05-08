@@ -59,7 +59,7 @@ class Mach3Bridge:
 
     @property
     def colba(self) -> dict[str, float | None]:
-        c = self._data.motion.colb-information
+        c = self._data.motion.colba_information
         return {"x": c.x, "y": c.y, "r": c.r, "h": c.h}
 
     @property
@@ -85,7 +85,7 @@ class Mach3Bridge:
 
     def set_colba(self, x: float, y: float, r: float, h: float) -> None:
         try:
-            self._data.motion.colb-information = ColbaConfig(
+            self._data.motion.colba_information = ColbaConfig(
                 x=float(x), y=float(y), r=float(r), h=float(h)
             )
         except (TypeError, ValueError) as exc:
@@ -134,7 +134,7 @@ class Mach3Bridge:
             return False
 
     def is_in_working_zone_local(self) -> bool | None:
-        c = self._data.motion.colb-information
+        c = self._data.motion.colba_information
         if c is None or c.h is None or c.r is None or c.x is None or c.y is None:
             return None
         if self._last_z >= c.h - 35:

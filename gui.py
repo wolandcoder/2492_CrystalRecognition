@@ -43,11 +43,7 @@ HOTKEYS = [
     ("Захват кадра",      f"{_MOD_KEY}+Shift+C"),
     ("ПИН элемент",       f"{_MOD_KEY}+Shift+P"),
     ("Трансформация",     f"{_MOD_KEY}+Shift+T"),
-<<<<<<< HEAD
     ("Манипулятор Mach3",      f"{_MOD_KEY}+Shift+M"),
-=======
-    ("Станок Mach3",      f"{_MOD_KEY}+Shift+M"),
->>>>>>> hse/main
     ("Перезапуск",        f"{_MOD_KEY}+Shift+X"),
     ("Горячие клавиши",   "?"),
     ("", ""),
@@ -493,13 +489,8 @@ async def main(page: ft.Page) -> None:
             "required": False,
         },
         "__particle_centers_movement": {
-<<<<<<< HEAD
             "title": "Движение / Манипулятор",
             "desc": "Визуализация позиции вакуумной трубки и данные для управления манипулятором Mach3",
-=======
-            "title": "Движение / Станок",
-            "desc": "Визуализация позиции вакуумной трубки и данные для управления станком Mach3",
->>>>>>> hse/main
             "deps": ["__particle_centers", "__particle_centers_nearest"],
             "required": False,
         },
@@ -1152,7 +1143,6 @@ async def main(page: ft.Page) -> None:
         int(_mach3_cfg.get("mach3_port", 5555)),
     )
 
-<<<<<<< HEAD
     def _apply_colba_from_cfg() -> None:
         cb = _mach3_cfg.get("colba", {}) or {}
         engine.mach3.set_colba(
@@ -1174,19 +1164,13 @@ async def main(page: ft.Page) -> None:
     _apply_colba_from_cfg()
     _apply_grid_from_cfg()
 
-=======
->>>>>>> hse/main
     _mach_connected = [False]
     _jog_step = [1.0]
 
     _JOG_STEPS = [0.01, 0.1, 1.0, 10.0]
 
     mach_appbar_icon = ft.Icon(ft.Icons.CIRCLE, size=10, color=ft.Colors.RED_400,
-<<<<<<< HEAD
                                tooltip="Манипулятор: отключён")
-=======
-                               tooltip="Станок: отключён")
->>>>>>> hse/main
 
     mach_dro_x = ft.Text("X: --", size=12, color=ft.Colors.WHITE70, selectable=True, width=100)
     mach_dro_y = ft.Text("Y: --", size=12, color=ft.Colors.WHITE70, selectable=True, width=100)
@@ -1211,7 +1195,6 @@ async def main(page: ft.Page) -> None:
         _mach_connected[0] = (state == "ok")
         if state == "ok":
             mach_appbar_icon.color = ft.Colors.GREEN_400
-<<<<<<< HEAD
             mach_appbar_icon.tooltip = "Манипулятор: подключён"
         elif state == "busy":
             mach_appbar_icon.color = ft.Colors.YELLOW_400
@@ -1222,18 +1205,6 @@ async def main(page: ft.Page) -> None:
         else:
             mach_appbar_icon.color = ft.Colors.RED_400
             mach_appbar_icon.tooltip = "Манипулятор: отключён"
-=======
-            mach_appbar_icon.tooltip = "Станок: подключён"
-        elif state == "busy":
-            mach_appbar_icon.color = ft.Colors.YELLOW_400
-            mach_appbar_icon.tooltip = "Станок: подключение..."
-        elif state == "warn":
-            mach_appbar_icon.color = ft.Colors.ORANGE_400
-            mach_appbar_icon.tooltip = "Станок: ошибка приёмов"
-        else:
-            mach_appbar_icon.color = ft.Colors.RED_400
-            mach_appbar_icon.tooltip = "Станок: отключён"
->>>>>>> hse/main
 
     async def _mach_auto_connect() -> None:
         _set_mach_status("busy")
@@ -1244,10 +1215,7 @@ async def main(page: ft.Page) -> None:
         if ok:
             _set_mach_status("ok")
             _update_dro_display(engine.mach3.position)
-<<<<<<< HEAD
             _refresh_workzone_local()
-=======
->>>>>>> hse/main
             mach_log_text.value = "Подключено, обнуление..."
             mach_log_text.color = ft.Colors.WHITE38
             page.update()
@@ -1255,10 +1223,7 @@ async def main(page: ft.Page) -> None:
                 await ev_loop.run_in_executor(None, engine.mach3.send_named_command, "allzero")
                 pos = await ev_loop.run_in_executor(None, engine.mach3.get_position)
                 _update_dro_display(pos)
-<<<<<<< HEAD
                 _refresh_workzone_local()
-=======
->>>>>>> hse/main
                 mach_log_text.value = "Готов к работе"
                 mach_log_text.color = ft.Colors.GREEN_300
             except Exception:
@@ -1268,7 +1233,6 @@ async def main(page: ft.Page) -> None:
         else:
             _set_mach_status("off")
             _update_dro_display(None)
-<<<<<<< HEAD
             ip = _mach3_cfg.get("mach3_ip", "?")
             port = _mach3_cfg.get("mach3_port", "?")
             mach_log_text.value = f"Не удалось подключиться к {ip}:{port} — работаем без манипулятора"
@@ -1286,47 +1250,30 @@ async def main(page: ft.Page) -> None:
                 snack.open = True
             except Exception:
                 pass
-=======
-            mach_log_text.value = "Станок недоступен — работа без станка"
-            mach_log_text.color = ft.Colors.WHITE38
->>>>>>> hse/main
         page.update()
 
     async def _on_mach_connect(e) -> None:
         await _mach_auto_connect()
 
     async def _on_mach_disconnect(e) -> None:
-<<<<<<< HEAD
         if _cycle_running[0]:
             _cycle_cancel[0] = True
         engine.mach3.disconnect()
         _set_mach_status("off")
         _update_dro_display(None)
         _update_workzone_badge(None)
-=======
-        engine.mach3.disconnect()
-        _set_mach_status("off")
-        _update_dro_display(None)
->>>>>>> hse/main
         mach_log_text.value = "Отключено"
         page.update()
 
     async def _on_mach_refresh_dro(e) -> None:
         pos = await ev_loop.run_in_executor(None, engine.mach3.get_position)
         _update_dro_display(pos)
-<<<<<<< HEAD
         _refresh_workzone_local()
-=======
->>>>>>> hse/main
         page.update()
 
     async def _mach_jog(axis: str, delta: float) -> None:
         if not _mach_connected[0]:
-<<<<<<< HEAD
             mach_log_text.value = "Манипулятор не подключён"
-=======
-            mach_log_text.value = "Станок не подключён"
->>>>>>> hse/main
             mach_log_text.color = ft.Colors.RED_300
             page.update()
             return
@@ -1340,10 +1287,7 @@ async def main(page: ft.Page) -> None:
             )
             pos = engine.mach3.position
             _update_dro_display(pos)
-<<<<<<< HEAD
             _refresh_workzone_local()
-=======
->>>>>>> hse/main
             mach_log_text.value = f"{axis.upper()} {delta:+.3f} → OK"
             mach_log_text.color = ft.Colors.GREEN_300
         except Exception as exc:
@@ -1433,11 +1377,7 @@ async def main(page: ft.Page) -> None:
 
     async def _on_named_cmd(cmd_name: str) -> None:
         if not _mach_connected[0]:
-<<<<<<< HEAD
             mach_log_text.value = "Манипулятор не подключён"
-=======
-            mach_log_text.value = "Станок не подключён"
->>>>>>> hse/main
             mach_log_text.color = ft.Colors.RED_300
             page.update()
             return
@@ -1448,10 +1388,7 @@ async def main(page: ft.Page) -> None:
             await ev_loop.run_in_executor(None, engine.mach3.send_named_command, cmd_name)
             pos = await ev_loop.run_in_executor(None, engine.mach3.get_position)
             _update_dro_display(pos)
-<<<<<<< HEAD
             _refresh_workzone_local()
-=======
->>>>>>> hse/main
             mach_log_text.value = f"{cmd_name} → OK"
             mach_log_text.color = ft.Colors.GREEN_300
         except Exception as exc:
@@ -1464,11 +1401,7 @@ async def main(page: ft.Page) -> None:
 
     async def _on_goto_crystal(e) -> None:
         if not _mach_connected[0]:
-<<<<<<< HEAD
             mach_log_text.value = "Манипулятор не подключён"
-=======
-            mach_log_text.value = "Станок не подключён"
->>>>>>> hse/main
             mach_log_text.color = ft.Colors.RED_300
             page.update()
             return
@@ -1498,10 +1431,7 @@ async def main(page: ft.Page) -> None:
             )
             pos = await ev_loop.run_in_executor(None, engine.mach3.get_position)
             _update_dro_display(pos)
-<<<<<<< HEAD
             _refresh_workzone_local()
-=======
->>>>>>> hse/main
             mach_log_text.value = f"Кристалл → ({tx:.2f}, {ty:.2f}) OK"
             mach_log_text.color = ft.Colors.GREEN_300
         except Exception as exc:
@@ -1511,17 +1441,11 @@ async def main(page: ft.Page) -> None:
 
     _named_cmds = [
         ("tozero", "Домой", ft.Icons.HOME),
-<<<<<<< HEAD
         ("toworkzone", "В зону", ft.Icons.CENTER_FOCUS_STRONG),
         ("zerotocamera", "К камере", ft.Icons.CAMERA),
         ("zerotozond", "К зонду", ft.Icons.GAVEL),
         ("allzero", "Обнулить", ft.Icons.EXPOSURE_ZERO),
         ("sendcristal", "Отдать", ft.Icons.OUTBOX),
-=======
-        ("zerotocamera", "К камере", ft.Icons.CAMERA),
-        ("zerotozond", "К зонду", ft.Icons.GAVEL),
-        ("allzero", "Обнулить", ft.Icons.EXPOSURE_ZERO),
->>>>>>> hse/main
     ]
 
     named_cmd_row = ft.Row(
@@ -1540,7 +1464,6 @@ async def main(page: ft.Page) -> None:
         wrap=True,
     )
 
-<<<<<<< HEAD
     # ── working zone (colba) display ──────────────────────────────
 
     workzone_badge = ft.Container(
@@ -2108,17 +2031,11 @@ async def main(page: ft.Page) -> None:
         border=ft.Border.all(1, ft.Colors.with_opacity(0.2, ft.Colors.PURPLE_200)),
     )
 
-=======
->>>>>>> hse/main
     machine_panel = ft.Container(
         content=ft.Column(controls=[
             ft.Row(controls=[
                 ft.Icon(ft.Icons.PRECISION_MANUFACTURING, size=16, color=ft.Colors.BLUE_200),
-<<<<<<< HEAD
                 ft.Text("Манипулятор Mach3", size=12, weight=ft.FontWeight.W_600),
-=======
-                ft.Text("Станок Mach3", size=12, weight=ft.FontWeight.W_600),
->>>>>>> hse/main
                 ft.Container(expand=True),
                 mach_appbar_icon,
                 ft.Container(width=4),
@@ -2136,21 +2053,15 @@ async def main(page: ft.Page) -> None:
                               style=ft.ButtonStyle(padding=ft.Padding.all(4))),
             ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Container(
-<<<<<<< HEAD
                 content=ft.Row(controls=[
                     mach_dro_x, mach_dro_y, mach_dro_z, mach_dro_a,
                     ft.Container(expand=True),
                     workzone_badge,
                 ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-=======
-                content=ft.Row(controls=[mach_dro_x, mach_dro_y, mach_dro_z, mach_dro_a],
-                               spacing=8),
->>>>>>> hse/main
                 padding=ft.Padding.symmetric(horizontal=8, vertical=4),
                 border_radius=6,
                 bgcolor=ft.Colors.with_opacity(0.06, ft.Colors.WHITE),
             ),
-<<<<<<< HEAD
             ft.Container(
                 content=ft.Row(controls=[
                     ft.Icon(ft.Icons.SCIENCE, size=14, color=ft.Colors.BLUE_200),
@@ -2162,8 +2073,6 @@ async def main(page: ft.Page) -> None:
             ),
             grid_section,
             cycle_section,
-=======
->>>>>>> hse/main
             ft.Divider(height=4, color=ft.Colors.WHITE10),
             ft.Row(controls=[
                 ft.Text("Управление", size=11, color=ft.Colors.WHITE54),
@@ -2211,11 +2120,7 @@ async def main(page: ft.Page) -> None:
         page.update()
 
     machine_btn = ft.IconButton(
-<<<<<<< HEAD
         icon=ft.Icons.PRECISION_MANUFACTURING, tooltip="Манипулятор Mach3",
-=======
-        icon=ft.Icons.PRECISION_MANUFACTURING, tooltip="Станок Mach3",
->>>>>>> hse/main
         icon_color=ft.Colors.WHITE70, icon_size=28, visible=False,
         on_click=on_toggle_machine,
     )
@@ -2286,11 +2191,8 @@ async def main(page: ft.Page) -> None:
     def _set_stopped_ui() -> None:
         nonlocal _paused
         _paused = False
-<<<<<<< HEAD
         if _cycle_running[0]:
             _cycle_cancel[0] = True
-=======
->>>>>>> hse/main
         start_stop_btn.content = ft.Text("Старт")
         start_stop_btn.icon = ft.Icons.PLAY_ARROW
         status_state.value = "Остановлен"
@@ -2389,13 +2291,8 @@ async def main(page: ft.Page) -> None:
         _set_playing_ui()
         restart_btn.visible = False
         page.update()
-<<<<<<< HEAD
         _stream_task = asyncio.ensure_future(_stream_loop())
         asyncio.ensure_future(_mach_auto_connect())
-=======
-        await _mach_auto_connect()
-        _stream_task = asyncio.ensure_future(_stream_loop())
->>>>>>> hse/main
 
     async def _do_stop() -> None:
         nonlocal _stream_task, running_snapshot
@@ -2677,7 +2574,6 @@ async def main(page: ft.Page) -> None:
             suffix=ft.Text("мм/м", size=11, color=ft.Colors.WHITE38),
         )
 
-<<<<<<< HEAD
         _colba_cfg = _mv_cfg.get("colba", {}) or {}
         colba_x_field = ft.TextField(
             value=str(_colba_cfg.get("x", 12.0)),
@@ -2759,8 +2655,6 @@ async def main(page: ft.Page) -> None:
             suffix=ft.Text("мм", size=11, color=ft.Colors.WHITE38),
         )
 
-=======
->>>>>>> hse/main
         settings_result = ft.Text("", size=12, selectable=True)
 
         dlg_mod_switches: dict[str, ft.Switch] = {}
@@ -2868,7 +2762,6 @@ async def main(page: ft.Page) -> None:
                     mv_sec["feed_speed"] = int(feed_field.value.strip())
                 except (ValueError, TypeError):
                     pass
-<<<<<<< HEAD
 
                 cb_sec = mv_sec.setdefault("colba", {})
                 try:
@@ -2941,8 +2834,6 @@ async def main(page: ft.Page) -> None:
                 except (ValueError, TypeError):
                     pass
 
-=======
->>>>>>> hse/main
                 with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
                     json.dump(raw, fp, ensure_ascii=False, indent=2)
                     fp.write("\n")
@@ -2962,14 +2853,11 @@ async def main(page: ft.Page) -> None:
                 mv_sec.get("mach3_ip", "192.168.1.125"),
                 int(mv_sec.get("mach3_port", 5555)),
             )
-<<<<<<< HEAD
             _apply_colba_from_cfg()
             _apply_grid_from_cfg()
             _update_colba_display()
             _update_grid_display()
             _refresh_workzone_local()
-=======
->>>>>>> hse/main
 
             _on_any_change()
 
@@ -3039,11 +2927,7 @@ async def main(page: ft.Page) -> None:
                 content=ft.Column(controls=[
                     ft.Row(controls=[
                         ft.Icon(ft.Icons.PRECISION_MANUFACTURING, size=18, color=ft.Colors.BLUE_200),
-<<<<<<< HEAD
                         ft.Text("Манипулятор Mach3", size=13, weight=ft.FontWeight.W_600),
-=======
-                        ft.Text("Станок Mach3", size=13, weight=ft.FontWeight.W_600),
->>>>>>> hse/main
                     ], spacing=8),
                     ft.Container(height=6),
                     ft.Text("Подключение", size=11, color=ft.Colors.WHITE54),
@@ -3063,7 +2947,6 @@ async def main(page: ft.Page) -> None:
                 padding=ft.Padding.all(14),
                 content=ft.Column(controls=[
                     ft.Row(controls=[
-<<<<<<< HEAD
                         ft.Icon(ft.Icons.SCIENCE, size=18, color=ft.Colors.BLUE_200),
                         ft.Text("Колба (рабочая зона)", size=13, weight=ft.FontWeight.W_600),
                     ], spacing=8),
@@ -3137,8 +3020,6 @@ async def main(page: ft.Page) -> None:
                 padding=ft.Padding.all(14),
                 content=ft.Column(controls=[
                     ft.Row(controls=[
-=======
->>>>>>> hse/main
                         ft.Icon(ft.Icons.AUTO_FIX_HIGH, size=18, color=ft.Colors.BLUE_200),
                         ft.Text("Нейро-моды", size=13, weight=ft.FontWeight.W_600),
                     ], spacing=8),
