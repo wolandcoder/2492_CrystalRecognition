@@ -25,11 +25,7 @@ def interactive_mode():
     print("  send                  - отправить команду на сервер")
     print("  get                   - запросить координаты со станка")
     print("  move x/y/z/a <число>  - перемещение по оси на указанное значение")
-<<<<<<< HEAD
     print("  send_command (tozero, fullcollibration, allzero) - выполнить последовательность")
-=======
-    print("  set_command (tozero, fullcollibration, allzero) - выполнить последовательность")
->>>>>>> hse/main
     print("  quit                  - выход")
     print("-" * 60)
 
@@ -75,11 +71,7 @@ def interactive_mode():
             data.motion.set_command(None).set_manual(None)
 
         elif action == "get":
-<<<<<<< HEAD
             data.motion.get_DRO()
-=======
-            data.motion.get_DRO(data.connection)
->>>>>>> hse/main
 
         elif action == "move":
             if len(parts) < 3:
@@ -88,7 +80,6 @@ def interactive_mode():
             axis = parts[1].lower()
             try:
                 delta = float(parts[2])
-<<<<<<< HEAD
                 data.motion.move_on(axis, delta)  
             except ValueError:
                 print("Ошибка: значение должно быть числом")
@@ -96,15 +87,6 @@ def interactive_mode():
         elif action == "send_command":
             if len(parts) < 2:
                 print("Использование: send_command <tozero/fullcollibration/allzero>")
-=======
-                data.motion.move_on(axis, delta, data.connection)
-            except ValueError:
-                print("Ошибка: значение должно быть числом")
-
-        elif action == "set_command":
-            if len(parts) < 2:
-                print("Использование: set_command <tozero/fullcollibration/allzero>")
->>>>>>> hse/main
                 continue
             command = parts[1].lower()
             data.motion.send_command(command)

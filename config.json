@@ -124,16 +124,11 @@
     "trail_length": 30
   },
   "movement": {
-<<<<<<< HEAD
     "mach3_ip": "172.18.164.41",
-=======
-    "mach3_ip": "192.168.1.125",
->>>>>>> hse/main
     "mach3_port": 5555,
     "vacuum_offset_x": -44.0,
     "vacuum_offset_y": -6.0,
     "feed_speed": 700,
-<<<<<<< HEAD
     "feed_speed_slow": 200,
     "colba": {
       "x": 12.0,
@@ -155,8 +150,5 @@
       "search_timeout_s": 5.0,
       "settle_s": 0.3
     }
-=======
-    "feed_speed_slow": 200
->>>>>>> hse/main
   }
 }
