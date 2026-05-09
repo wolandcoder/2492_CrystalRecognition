@@ -110,6 +110,12 @@ class _StreamEngine:
         self._source = VideoSourceFactory.from_config(config)
         log.info("Engine: source OK, mods=%s", config.neural.mods)
         self._neural = NeuralManager(mod_names=config.neural.mods)
+        # Автоизоляция тяжёлых модов: детекция кристаллов идёт в отдельном
+        # потоке с таймаутом 2с, чтобы зависание одного кадра не вешало UI.
+        if "__particle_centers" in config.neural.mods:
+            self._neural.set_mod_isolation(
+                "__particle_centers", isolate=True, timeout_s=2.0,
+            )
         self._source_type = config.source.type
         self._source_label = (
             str(config.source.camera.index)
@@ -130,7 +136,13 @@ class _StreamEngine:
         self._running = False
         src = self._source
         self._source = None
+        neural = self._neural
         self._neural = None
+        if neural is not None:
+            try:
+                neural.shutdown()
+            except Exception:
+                log.exception("Engine: neural.shutdown() error")
         if src is not None:
             try:
                 src.release()
@@ -144,6 +156,23 @@ class _StreamEngine:
     @property
     def fps(self) -> float:
         return self._fps
+
+    def metrics_snapshot(self) -> dict:
+        if self._neural is None:
+            return {"total_frames": 0, "dropped_frames": 0,
+                    "pipeline_fps": 0.0, "avg_total_ms": 0.0, "mods": []}
+        return self._neural.metrics.snapshot()
+
+    def reload_calibration(self) -> bool:
+        """Перечитать калибровку из config.json в активном grid-моде."""
+        if self._neural is None:
+            return False
+        for w in self._neural._mods:
+            if w.name == "__particle_centers_grid":
+                fn = getattr(w.mod, "reload_calibration", None)
+                if callable(fn):
+                    return bool(fn())
+        return False
 
     def read_and_encode(self) -> str | None:
         if not self._running or self._source is None:
@@ -2514,6 +2543,385 @@ async def main(page: ft.Page) -> None:
         page.show_dialog(dlg)
         page.update()
 
+    def on_perspective_calibrate(e) -> None:
+        """Перспективная калибровка по 4 опорным точкам.
+
+        Оператор задаёт 4 пары (px_x, px_y, world_x, world_y) — координаты
+        в кадре и реальные мировые координаты в мм. Программа строит матрицу
+        гомографии и сохраняет в config.json (particle_grid.perspective).
+        """
+        from __core.__camera.__neural.calibration import (
+            CalibrationPoint, PerspectiveCalibrator,
+            disable_calibration, save_calibration,
+        )
+        from pathlib import Path as _Path
+
+        cfg_path = _Path(CONFIG_PATH)
+        existing = (
+            _raw_cfg.get("particle_grid", {}).get("perspective", {}) or {}
+        )
+        existing_points = existing.get("points", [])
+        existing_rms = existing.get("rms_error_mm")
+        existing_active = bool(
+            _raw_cfg.get("particle_grid", {}).get("use_perspective", False),
+        )
+
+        rows: list[ft.Row] = []
+        fields: list[tuple[ft.TextField, ft.TextField, ft.TextField, ft.TextField]] = []
+
+        def _mk_tf(width: int, hint: str = "") -> ft.TextField:
+            return ft.TextField(
+                width=width, dense=True, height=38, text_size=12,
+                hint_text=hint, content_padding=8,
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
+
+        particles = engine.last_shared.get("particle_centers") or []
+        for i in range(4):
+            px_x = _mk_tf(76, "px X")
+            px_y = _mk_tf(76, "px Y")
+            mm_x = _mk_tf(76, "мм X")
+            mm_y = _mk_tf(76, "мм Y")
+            if i < len(existing_points):
+                p = existing_points[i]
+                px_x.value = f"{p.get('px_x', 0):.1f}"
+                px_y.value = f"{p.get('px_y', 0):.1f}"
+                mm_x.value = f"{p.get('world_x', 0):.2f}"
+                mm_y.value = f"{p.get('world_y', 0):.2f}"
+            elif i < len(particles):
+                p = particles[i]
+                px_x.value = str(p["cx"])
+                px_y.value = str(p["cy"])
+            fields.append((px_x, px_y, mm_x, mm_y))
+            rows.append(
+                ft.Row(
+                    controls=[
+                        ft.Container(
+                            content=ft.Text(f"P{i + 1}", size=12,
+                                              weight=ft.FontWeight.W_600,
+                                              color=ft.Colors.WHITE54),
+                            width=24,
+                            alignment=ft.Alignment.CENTER,
+                        ),
+                        px_x, px_y, mm_x, mm_y,
+                    ],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            )
+
+        result_text = ft.Text("", size=12, selectable=True)
+
+        def _parse_float(tf: ft.TextField) -> float | None:
+            try:
+                return float((tf.value or "").replace(",", ".").strip())
+            except (ValueError, TypeError):
+                return None
+
+        def _collect_points() -> list[CalibrationPoint] | None:
+            pts: list[CalibrationPoint] = []
+            for i, (a, b, c, d) in enumerate(fields):
+                vals = [_parse_float(a), _parse_float(b),
+                        _parse_float(c), _parse_float(d)]
+                if any(v is None for v in vals):
+                    result_text.value = f"P{i + 1}: введите все 4 числа"
+                    result_text.color = ft.Colors.RED_300
+                    return None
+                pts.append(CalibrationPoint(
+                    px_x=vals[0], px_y=vals[1],
+                    world_x=vals[2], world_y=vals[3],
+                    label=f"P{i + 1}",
+                ))
+            return pts
+
+        def _compute(_) -> None:
+            pts = _collect_points()
+            if pts is None:
+                page.update()
+                return
+            try:
+                res = PerspectiveCalibrator.compute(pts)
+            except Exception as ex:
+                result_text.value = f"Ошибка: {ex}"
+                result_text.color = ft.Colors.RED_300
+                page.update()
+                return
+            result_text.value = (
+                f"OK. RMS = {res.rms_error_mm:.4f} мм. "
+                f"Нажмите «Сохранить и применить»."
+            )
+            result_text.color = ft.Colors.GREEN_300
+            page.update()
+
+        async def _save_apply(_) -> None:
+            pts = _collect_points()
+            if pts is None:
+                page.update()
+                return
+            try:
+                res = PerspectiveCalibrator.compute(pts)
+                save_calibration(cfg_path, res, enable=True)
+            except Exception as ex:
+                result_text.value = f"Ошибка: {ex}"
+                result_text.color = ft.Colors.RED_300
+                page.update()
+                return
+
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                    _raw_cfg.clear()
+                    _raw_cfg.update(json.load(fp))
+            except Exception:
+                pass
+
+            applied = False
+            try:
+                applied = engine.reload_calibration()
+            except Exception:
+                applied = False
+
+            page.pop_dialog()
+            page.update()
+
+            if not applied and engine.running:
+                await _do_stop()
+                await _do_start()
+
+        async def _disable(_) -> None:
+            disable_calibration(cfg_path)
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                    _raw_cfg.clear()
+                    _raw_cfg.update(json.load(fp))
+            except Exception:
+                pass
+            try:
+                engine.reload_calibration()
+            except Exception:
+                pass
+            page.pop_dialog()
+            page.update()
+            if engine.running:
+                await _do_stop()
+                await _do_start()
+
+        status_line = "Калибровка не задана"
+        status_color = ft.Colors.WHITE54
+        if existing_rms is not None:
+            if existing_active:
+                status_line = (
+                    f"Активна. RMS = {existing_rms:.4f} мм"
+                )
+                status_color = ft.Colors.GREEN_300
+            else:
+                status_line = (
+                    f"Сохранена, но отключена. RMS = {existing_rms:.4f} мм"
+                )
+                status_color = ft.Colors.YELLOW_300
+
+        header_row = ft.Row(
+            controls=[
+                ft.Container(width=24),
+                ft.Text("px X", size=11, color=ft.Colors.WHITE54, width=76,
+                          text_align=ft.TextAlign.CENTER),
+                ft.Text("px Y", size=11, color=ft.Colors.WHITE54, width=76,
+                          text_align=ft.TextAlign.CENTER),
+                ft.Text("мм X", size=11, color=ft.Colors.BLUE_200, width=76,
+                          text_align=ft.TextAlign.CENTER),
+                ft.Text("мм Y", size=11, color=ft.Colors.BLUE_200, width=76,
+                          text_align=ft.TextAlign.CENTER),
+            ],
+            spacing=6,
+        )
+
+        body = ft.Column(
+            controls=[
+                ft.Text(status_line, size=12, color=status_color),
+                ft.Text(
+                    "Введите 4 опорные точки. Pх — координаты в кадре, "
+                    "мм — реальные координаты на рабочем поле.",
+                    size=11, color=ft.Colors.WHITE54,
+                ),
+                ft.Container(height=4),
+                header_row,
+                *rows,
+                ft.Container(height=4),
+                result_text,
+            ],
+            spacing=6, tight=True, width=460,
+        )
+
+        actions = [
+            ft.OutlinedButton(content=ft.Text("Вычислить"),
+                              icon=ft.Icons.CALCULATE, on_click=_compute),
+            ft.Button(content=ft.Text("Сохранить и применить"),
+                     icon=ft.Icons.CHECK, on_click=_save_apply),
+        ]
+        if existing_rms is not None and existing_active:
+            actions.append(
+                ft.OutlinedButton(
+                    content=ft.Text("Отключить"),
+                    icon=ft.Icons.LINK_OFF,
+                    on_click=_disable,
+                ),
+            )
+        actions.append(
+            ft.OutlinedButton(
+                content=ft.Text("Отмена"),
+                on_click=lambda _: (page.pop_dialog(), page.update()),
+            ),
+        )
+
+        dlg = ft.AlertDialog(
+            title=ft.Row(controls=[
+                ft.Icon(ft.Icons.GRID_4X4, color=ft.Colors.BLUE_200, size=20),
+                ft.Text("Перспективная калибровка (4 точки)",
+                          weight=ft.FontWeight.BOLD),
+            ], spacing=8),
+            content=body,
+            actions=actions,
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(dlg)
+        page.update()
+
+    perspective_btn = ft.IconButton(
+        icon=ft.Icons.GRID_4X4, tooltip="Перспективная калибровка (4 точки)",
+        icon_color=ft.Colors.WHITE70, icon_size=22,
+        on_click=on_perspective_calibrate,
+    )
+
+    def on_show_metrics(e) -> None:
+        """Показать метрики пайплайна обработки кадров."""
+        snap = engine.metrics_snapshot()
+        rows: list[ft.Row] = [
+            ft.Row(controls=[
+                ft.Text("Мод", size=11, color=ft.Colors.WHITE54, width=190,
+                          weight=ft.FontWeight.W_600),
+                ft.Text("avg, мс", size=11, color=ft.Colors.WHITE54, width=70,
+                          text_align=ft.TextAlign.RIGHT,
+                          weight=ft.FontWeight.W_600),
+                ft.Text("max, мс", size=11, color=ft.Colors.WHITE54, width=70,
+                          text_align=ft.TextAlign.RIGHT,
+                          weight=ft.FontWeight.W_600),
+                ft.Text("FPS", size=11, color=ft.Colors.WHITE54, width=60,
+                          text_align=ft.TextAlign.RIGHT,
+                          weight=ft.FontWeight.W_600),
+                ft.Text("calls", size=11, color=ft.Colors.WHITE54, width=70,
+                          text_align=ft.TextAlign.RIGHT,
+                          weight=ft.FontWeight.W_600),
+                ft.Text("err", size=11, color=ft.Colors.WHITE54, width=50,
+                          text_align=ft.TextAlign.RIGHT,
+                          weight=ft.FontWeight.W_600),
+            ], spacing=4),
+            ft.Divider(height=4, color=ft.Colors.WHITE10),
+        ]
+        for m in snap.get("mods", []):
+            err_color = ft.Colors.RED_300 if m["errors"] > 0 else ft.Colors.WHITE70
+            rows.append(ft.Row(controls=[
+                ft.Text(m["name"], size=11, width=190, color=ft.Colors.WHITE),
+                ft.Text(f"{m['avg_ms']:.2f}", size=11, width=70,
+                          text_align=ft.TextAlign.RIGHT, color=ft.Colors.WHITE70),
+                ft.Text(f"{m['max_ms']:.2f}", size=11, width=70,
+                          text_align=ft.TextAlign.RIGHT, color=ft.Colors.WHITE54),
+                ft.Text(f"{m['fps']:.1f}", size=11, width=60,
+                          text_align=ft.TextAlign.RIGHT, color=ft.Colors.WHITE70),
+                ft.Text(str(m["calls"]), size=11, width=70,
+                          text_align=ft.TextAlign.RIGHT, color=ft.Colors.WHITE54),
+                ft.Text(str(m["errors"]), size=11, width=50,
+                          text_align=ft.TextAlign.RIGHT, color=err_color),
+            ], spacing=4))
+            if m.get("last_error"):
+                rows.append(ft.Row(controls=[
+                    ft.Container(width=8),
+                    ft.Text(f"err: {m['last_error']}", size=10,
+                              color=ft.Colors.RED_200, selectable=True),
+                ]))
+
+        try:
+            from __core.__camera.__neural.optim import _KERNEL_CACHE, get_profiler
+            kc = _KERNEL_CACHE.stats()
+            kc_line = (
+                f"Кэш ядер: {kc['size']} элементов, "
+                f"hit-rate {kc['hit_rate'] * 100:.1f}% "
+                f"({kc['hits']}/{kc['hits'] + kc['misses']})"
+            )
+            prof = get_profiler()
+            prof_state = "вкл" if prof.enabled else "выкл"
+            prof_line = f"Профайлер: {prof_state}"
+        except Exception:
+            kc_line = ""
+            prof_line = ""
+
+        body = ft.Column(
+            controls=[
+                ft.Row(controls=[
+                    ft.Icon(ft.Icons.SPEED, size=16, color=ft.Colors.BLUE_200),
+                    ft.Text(
+                        f"Пайплайн: {snap['pipeline_fps']:.1f} FPS, "
+                        f"avg {snap['avg_total_ms']:.2f} мс, "
+                        f"кадров {snap['total_frames']}, "
+                        f"дропов {snap['dropped_frames']}",
+                        size=12, color=ft.Colors.WHITE70,
+                    ),
+                ], spacing=6),
+                ft.Container(height=6),
+                *rows,
+                ft.Divider(height=8, color=ft.Colors.WHITE10),
+                ft.Text(kc_line, size=11, color=ft.Colors.WHITE54),
+                ft.Text(prof_line, size=11, color=ft.Colors.WHITE54),
+            ],
+            spacing=2, tight=True, width=560,
+        )
+
+        async def _toggle_profiler(_) -> None:
+            try:
+                from __core.__camera.__neural.optim import get_profiler
+                p = get_profiler()
+                p.enable(not p.enabled)
+            except Exception:
+                pass
+            page.pop_dialog()
+            page.update()
+            on_show_metrics(None)
+
+        async def _reset(_) -> None:
+            if engine._neural is not None:
+                engine._neural.reset_metrics()
+            try:
+                from __core.__camera.__neural.optim import get_profiler
+                get_profiler().reset()
+            except Exception:
+                pass
+            page.pop_dialog()
+            page.update()
+            on_show_metrics(None)
+
+        dlg = ft.AlertDialog(
+            title=ft.Row(controls=[
+                ft.Icon(ft.Icons.SPEED, color=ft.Colors.BLUE_200, size=20),
+                ft.Text("Метрики пайплайна", weight=ft.FontWeight.BOLD),
+            ], spacing=8),
+            content=body,
+            actions=[
+                ft.OutlinedButton(content=ft.Text("Профайлер вкл/выкл"),
+                                  icon=ft.Icons.TIMER, on_click=_toggle_profiler),
+                ft.OutlinedButton(content=ft.Text("Сбросить"),
+                                  icon=ft.Icons.RESTART_ALT, on_click=_reset),
+                ft.Button(content=ft.Text("Закрыть"),
+                         on_click=lambda _: (page.pop_dialog(), page.update())),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(dlg)
+        page.update()
+
+    metrics_btn = ft.IconButton(
+        icon=ft.Icons.SPEED, tooltip="Метрики пайплайна",
+        icon_color=ft.Colors.WHITE70, icon_size=22,
+        on_click=on_show_metrics,
+    )
+
     calibrate_btn = ft.IconButton(
         icon=ft.Icons.SQUARE_FOOT, tooltip="Калибровка масштаба",
         icon_color=ft.Colors.WHITE70, icon_size=22,
@@ -3068,6 +3476,8 @@ async def main(page: ft.Page) -> None:
                 ft.Container(width=8),
                 mach_appbar_icon,
                 ft.Container(width=4),
+                metrics_btn,
+                perspective_btn,
                 calibrate_btn,
                 settings_btn,
             ],

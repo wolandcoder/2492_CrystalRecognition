@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from ..base import FrameContext, NeuralMod
+from ..optim import GrayscaleCache, get_kernel, profile
 
 
                                                            
@@ -239,19 +240,21 @@ class Mod(NeuralMod):
         self._clahe = cv2.createCLAHE(
             clipLimit=self.CLAHE_CLIP, tileGridSize=self.CLAHE_GRID,
         )
-        self._kern_e3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        self._kern_e5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        self._kern_r5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        self._kern_e7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self._kern_e3 = get_kernel(cv2.MORPH_ELLIPSE, (3, 3))
+        self._kern_e5 = get_kernel(cv2.MORPH_ELLIPSE, (5, 5))
+        self._kern_r5 = get_kernel(cv2.MORPH_RECT, (5, 5))
+        self._kern_e7 = get_kernel(cv2.MORPH_ELLIPSE, (7, 7))
         self._tracks: list[_Track] = []
         self._bg: np.ndarray | None = None
         self._bg_n = 0
         self._colors_loaded = False
+        self._gray_cache = GrayscaleCache()
 
                                                             
             
                                                             
 
+    @profile("particle_centers.apply")
     def apply(self, frame: object, context: FrameContext) -> object:
         if not self._colors_loaded:
             self._load_colors(context)
@@ -263,9 +266,11 @@ class Mod(NeuralMod):
         small = cv2.resize(frame, (self.WORK_WIDTH, sh), interpolation=cv2.INTER_AREA)
         inv = 1.0 / scale
 
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        gray = self._gray_cache.get(small)
         gray_f = gray.astype(np.float32)
         hsv_small = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        context.shared["_small_gray"] = gray
+        context.shared["_small_scale"] = scale
 
         self._update_bg(gray_f)
         fg = self._fg_mask(gray_f)
@@ -409,6 +414,7 @@ class Mod(NeuralMod):
                                    
                                                             
 
+    @profile("particle_centers._split_touching")
     def _split_touching(self, binary: np.ndarray) -> np.ndarray:
         contours_raw, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours_raw:
@@ -691,6 +697,7 @@ class Mod(NeuralMod):
               
                                                             
 
+    @profile("particle_centers._update_tracks")
     def _update_tracks(self, dets: list[_Det]) -> None:
         mt: set[int] = set()
         md: set[int] = set()

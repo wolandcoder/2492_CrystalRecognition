@@ -238,6 +238,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("view", help="Запустить просмотр текущего источника")
     subparsers.add_parser("list-cameras", help="Показать доступные камеры и их параметры")
 
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="Прогнать N кадров через пайплайн и вывести метрики",
+    )
+    metrics_parser.add_argument(
+        "--frames", type=int, default=120,
+        help="Сколько кадров прогнать (по умолчанию 120)",
+    )
+    metrics_parser.add_argument(
+        "--profile", action="store_true",
+        help="Включить детальный профайлер (по горячему пути)",
+    )
+
     mods_parser = subparsers.add_parser("mods", help="Управление нейро-модами")
     mods_subparsers = mods_parser.add_subparsers(dest="mods_command", required=True)
     mods_subparsers.add_parser("show", help="Показать включенные моды")
@@ -363,8 +376,105 @@ def main() -> int:
         viewer.run()
         return 0
 
+    if args.command == "metrics":
+        return _run_metrics(config, args.frames, args.profile)
+
     parser.print_help()
     return 1
+
+
+def _run_metrics(config: object, frames: int, enable_profile: bool) -> int:
+    """Прогон N кадров через пайплайн с выводом метрик per-mod.
+
+    Источник: текущий из config.json (камера или файл).
+    """
+    from __core.__camera.video_source import VideoSourceFactory
+    from __core.__camera.__neural.base import FrameContext
+    from __core.__camera.__neural.optim import (
+        _KERNEL_CACHE, get_profiler,
+    )
+
+    if enable_profile:
+        get_profiler().enable(True)
+
+    print(_accent(
+        f"Прогон метрик: {frames} кадров, моды: {config.neural.mods}",
+    ))
+    src = VideoSourceFactory.from_config(config)
+    mgr = NeuralManager(mod_names=config.neural.mods)
+    if "__particle_centers" in config.neural.mods:
+        mgr.set_mod_isolation("__particle_centers", isolate=True, timeout_s=2.0)
+
+    processed = 0
+    try:
+        for i in range(frames):
+            res = src.read()
+            if not res.ok or res.frame is None:
+                print(_warn(f"Источник вернул пустой кадр на {i}"))
+                break
+            h, w = res.frame.shape[:2]
+            ctx = FrameContext(
+                fps=0.0,
+                source_type=config.source.type,
+                source_label=str(config.source.camera.index)
+                if config.source.type == "camera"
+                else config.source.file.path,
+                frame_width=w, frame_height=h, frame_index=i,
+            )
+            mgr.apply(res.frame, ctx)
+            processed += 1
+    finally:
+        snap = mgr.metrics.snapshot()
+        try:
+            src.release()
+        except Exception:
+            pass
+        mgr.shutdown()
+
+    print()
+    print(_accent(
+        f"Кадров обработано: {processed}/{frames}, "
+        f"пайплайн: {snap['pipeline_fps']:.1f} FPS, "
+        f"avg {snap['avg_total_ms']:.2f} мс",
+    ))
+    print()
+    header = (
+        f"  {'мод':<32}{'avg, мс':>10}{'max, мс':>10}"
+        f"{'fps':>8}{'calls':>8}{'err':>6}"
+    )
+    print(_accent(header))
+    print("  " + "-" * (len(header) - 2))
+    for m in snap.get("mods", []):
+        line = (
+            f"  {m['name']:<32}{m['avg_ms']:>10.2f}{m['max_ms']:>10.2f}"
+            f"{m['fps']:>8.1f}{m['calls']:>8d}{m['errors']:>6d}"
+        )
+        if m["errors"] > 0:
+            line = _warn(line)
+        print(line)
+        if m.get("last_error"):
+            print(_warn(f"      ! {m['last_error']}"))
+
+    kc = _KERNEL_CACHE.stats()
+    print()
+    print(_accent("Кэш морфологических ядер:"))
+    print(
+        f"  size={kc['size']}, hits={kc['hits']}, "
+        f"misses={kc['misses']}, hit_rate={kc['hit_rate'] * 100:.1f}%",
+    )
+
+    prof = get_profiler()
+    if prof.enabled:
+        print()
+        print(_accent("Топ-10 горячих участков:"))
+        report = prof.report()[:10]
+        for row in report:
+            print(
+                f"  {row['name']:<48}{row['avg_ms']:>10.3f} мс  "
+                f"× {row['calls']:<6d}  total {row['total_ms']:>8.1f} мс",
+            )
+
+    return 0
 
 
 if __name__ == "__main__":
