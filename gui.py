@@ -99,6 +99,7 @@ class _StreamEngine:
         self.last_b64: str = ""
         self.last_frame_w: int = 0
         self.last_frame_h: int = 0
+        self.last_raw_frame: np.ndarray | None = None
         self.pin_tid: int | None = None
         self.transform_angles: list[float] = [0.0, 0.0, 0.0]
         self.transform_before_neural: bool = True
@@ -200,6 +201,7 @@ class _StreamEngine:
         if self._has_transform() and self.transform_before_neural:
             raw_frame = self._apply_transform(raw_frame)
 
+        self.last_raw_frame = raw_frame.copy()
         fh, fw = raw_frame.shape[:2]
         ctx = FrameContext(
             fps=self._fps,
@@ -2549,10 +2551,14 @@ async def main(page: ft.Page) -> None:
         Оператор задаёт 4 пары (px_x, px_y, world_x, world_y) — координаты
         в кадре и реальные мировые координаты в мм. Программа строит матрицу
         гомографии и сохраняет в config.json (particle_grid.perspective).
+
+        Поддерживается автоопределение опорных точек по эталонному паттерну
+        (шахматная доска / сетка кругов) — кнопка «Авто-определить».
         """
         from __core.__camera.__neural.calibration import (
-            CalibrationPoint, PerspectiveCalibrator,
-            disable_calibration, save_calibration,
+            AutoDetectResult, CalibrationPoint, CalibrationResult,
+            PerspectiveCalibrator, auto_detect_pattern, detect_chessboard,
+            detect_circles_grid, disable_calibration, save_calibration,
         )
         from pathlib import Path as _Path
 
@@ -2611,6 +2617,9 @@ async def main(page: ft.Page) -> None:
             )
 
         result_text = ft.Text("", size=12, selectable=True)
+        # Кэш предпосчитанной по N точек матрицы (от автодетекции).
+        # Если задан — при сохранении используется он, а не пересчёт по 4 точкам.
+        autodetect_state = {"result": None}  # CalibrationResult | None
 
         def _parse_float(tf: ft.TextField) -> float | None:
             try:
@@ -2634,7 +2643,27 @@ async def main(page: ft.Page) -> None:
                 ))
             return pts
 
+        def _fill_from_corners(corners: list[CalibrationPoint]) -> None:
+            """Заполнить 4 строки таблицы UI углами найденного паттерна."""
+            for i in range(min(4, len(corners))):
+                p = corners[i]
+                px_x, px_y, mm_x, mm_y = fields[i]
+                px_x.value = f"{p.px_x:.1f}"
+                px_y.value = f"{p.px_y:.1f}"
+                mm_x.value = f"{p.world_x:.2f}"
+                mm_y.value = f"{p.world_y:.2f}"
+
         def _compute(_) -> None:
+            # Если есть результат от автодетекции — берём его.
+            if autodetect_state["result"] is not None:
+                res = autodetect_state["result"]
+                result_text.value = (
+                    f"Авто: RMS = {res.rms_error_mm:.4f} мм по "
+                    f"{len(res.points)} точкам. Нажмите «Сохранить и применить»."
+                )
+                result_text.color = ft.Colors.GREEN_300
+                page.update()
+                return
             pts = _collect_points()
             if pts is None:
                 page.update()
@@ -2654,12 +2683,21 @@ async def main(page: ft.Page) -> None:
             page.update()
 
         async def _save_apply(_) -> None:
-            pts = _collect_points()
-            if pts is None:
-                page.update()
-                return
+            # Приоритет: предпосчитанный результат от автодетекции (по N точкам).
+            res = autodetect_state["result"]
+            if res is None:
+                pts = _collect_points()
+                if pts is None:
+                    page.update()
+                    return
+                try:
+                    res = PerspectiveCalibrator.compute(pts)
+                except Exception as ex:
+                    result_text.value = f"Ошибка: {ex}"
+                    result_text.color = ft.Colors.RED_300
+                    page.update()
+                    return
             try:
-                res = PerspectiveCalibrator.compute(pts)
                 save_calibration(cfg_path, res, enable=True)
             except Exception as ex:
                 result_text.value = f"Ошибка: {ex}"
@@ -2686,6 +2724,196 @@ async def main(page: ft.Page) -> None:
             if not applied and engine.running:
                 await _do_stop()
                 await _do_start()
+
+        def _open_auto_detect(_) -> None:
+            """Подменю автоопределения опорных точек по эталонному паттерну."""
+            pattern_dd = ft.Dropdown(
+                width=240, dense=True,
+                value="chessboard",
+                options=[
+                    ft.dropdown.Option("chessboard", "Шахматная доска"),
+                    ft.dropdown.Option(
+                        "circles_asymmetric", "Сетка кругов (асим.)",
+                    ),
+                    ft.dropdown.Option(
+                        "circles_symmetric", "Сетка кругов (сим.)",
+                    ),
+                    ft.dropdown.Option("auto", "Авто (любой)"),
+                ],
+                label="Паттерн",
+            )
+
+            cols_tf = ft.TextField(
+                width=80, dense=True, height=38, text_size=12,
+                value="9", label="cols",
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
+            rows_tf = ft.TextField(
+                width=80, dense=True, height=38, text_size=12,
+                value="6", label="rows",
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
+            spacing_tf = ft.TextField(
+                width=110, dense=True, height=38, text_size=12,
+                value="5.0", label="шаг, мм",
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
+
+            hint = ft.Text(
+                "Шахматная доска: cols/rows — число *внутренних* углов "
+                "(для доски 10×7 клеток это 9×6). Шаг — длина клетки в мм.",
+                size=11, color=ft.Colors.WHITE54,
+                width=420,
+            )
+            ad_status = ft.Text("", size=12, selectable=True)
+
+            def _read_int(tf: ft.TextField, default: int) -> int:
+                try:
+                    return int((tf.value or "").strip())
+                except (ValueError, TypeError):
+                    return default
+
+            def _read_float(tf: ft.TextField, default: float) -> float:
+                try:
+                    return float((tf.value or "").replace(",", ".").strip())
+                except (ValueError, TypeError):
+                    return default
+
+            def _on_pattern_change(_ev) -> None:
+                p = pattern_dd.value
+                if p == "chessboard":
+                    cols_tf.value, rows_tf.value = "9", "6"
+                    spacing_tf.label = "клетка, мм"
+                    hint.value = (
+                        "Шахматная доска: cols/rows — число *внутренних* углов "
+                        "(для доски 10×7 клеток это 9×6). Шаг — длина клетки в мм."
+                    )
+                elif p == "circles_asymmetric":
+                    cols_tf.value, rows_tf.value = "4", "11"
+                    spacing_tf.label = "шаг, мм"
+                    hint.value = (
+                        "Асимметричная сетка кругов: точнее по углу поворота. "
+                        "По умолчанию 4×11 (стандартный шаблон OpenCV)."
+                    )
+                elif p == "circles_symmetric":
+                    cols_tf.value, rows_tf.value = "7", "5"
+                    spacing_tf.label = "шаг, мм"
+                    hint.value = (
+                        "Симметричная сетка кругов: проще распечатать. "
+                        "Укажите число кругов по столбцам и строкам."
+                    )
+                else:
+                    hint.value = (
+                        "Программа последовательно попробует все паттерны и "
+                        "выберет первый, который удастся обнаружить."
+                    )
+                page.update()
+
+            pattern_dd.on_change = _on_pattern_change
+
+            def _do_detect(_) -> None:
+                frame = engine.last_raw_frame
+                if frame is None:
+                    ad_status.value = (
+                        "Нет кадра. Запустите видеопоток и попробуйте снова."
+                    )
+                    ad_status.color = ft.Colors.RED_300
+                    page.update()
+                    return
+
+                p = pattern_dd.value
+                cols = _read_int(cols_tf, 9)
+                rows = _read_int(rows_tf, 6)
+                spacing = _read_float(spacing_tf, 5.0)
+
+                ad_status.value = "Идёт поиск паттерна…"
+                ad_status.color = ft.Colors.WHITE70
+                page.update()
+
+                detect_res: AutoDetectResult | None = None
+                try:
+                    if p == "chessboard":
+                        detect_res = detect_chessboard(
+                            frame, (cols, rows), spacing,
+                        )
+                    elif p == "circles_asymmetric":
+                        detect_res = detect_circles_grid(
+                            frame, (cols, rows), spacing, asymmetric=True,
+                        )
+                    elif p == "circles_symmetric":
+                        detect_res = detect_circles_grid(
+                            frame, (cols, rows), spacing, asymmetric=False,
+                        )
+                    else:
+                        detect_res = auto_detect_pattern(
+                            frame,
+                            chessboard_size=(cols, rows),
+                            chessboard_square_mm=spacing,
+                            circles_size=(cols, rows),
+                            circles_spacing_mm=spacing,
+                        )
+                except Exception as ex:
+                    ad_status.value = f"Ошибка детектора: {ex}"
+                    ad_status.color = ft.Colors.RED_300
+                    page.update()
+                    return
+
+                if detect_res is None or not detect_res.points:
+                    ad_status.value = (
+                        "Паттерн не найден. Проверьте: видна ли доска целиком, "
+                        "освещение, нет ли бликов, верны ли cols/rows."
+                    )
+                    ad_status.color = ft.Colors.RED_300
+                    page.update()
+                    return
+
+                try:
+                    res = PerspectiveCalibrator.compute(detect_res.points)
+                except Exception as ex:
+                    ad_status.value = f"Не удалось построить матрицу: {ex}"
+                    ad_status.color = ft.Colors.RED_300
+                    page.update()
+                    return
+
+                autodetect_state["result"] = res
+                _fill_from_corners(detect_res.corner_points)
+
+                page.pop_dialog()  # close auto-detect sub-dialog
+                result_text.value = (
+                    f"Авто-{detect_res.pattern}: найдено "
+                    f"{len(detect_res.points)} точек, "
+                    f"RMS = {res.rms_error_mm:.4f} мм. "
+                    f"Нажмите «Сохранить и применить»."
+                )
+                result_text.color = ft.Colors.GREEN_300
+                page.update()
+
+            sub_dlg = ft.AlertDialog(
+                title=ft.Row(controls=[
+                    ft.Icon(ft.Icons.AUTO_AWESOME,
+                              color=ft.Colors.AMBER_300, size=20),
+                    ft.Text("Авто-определение по паттерну",
+                              weight=ft.FontWeight.BOLD),
+                ], spacing=8),
+                content=ft.Column(controls=[
+                    pattern_dd,
+                    ft.Row(controls=[cols_tf, rows_tf, spacing_tf], spacing=8),
+                    hint,
+                    ft.Container(height=4),
+                    ad_status,
+                ], spacing=10, tight=True, width=460),
+                actions=[
+                    ft.Button(content=ft.Text("Найти на текущем кадре"),
+                              icon=ft.Icons.CENTER_FOCUS_STRONG,
+                              on_click=_do_detect),
+                    ft.OutlinedButton(content=ft.Text("Отмена"),
+                                      on_click=lambda _: (
+                                          page.pop_dialog(), page.update())),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+            page.show_dialog(sub_dlg)
+            page.update()
 
         async def _disable(_) -> None:
             disable_calibration(cfg_path)
@@ -2738,8 +2966,9 @@ async def main(page: ft.Page) -> None:
             controls=[
                 ft.Text(status_line, size=12, color=status_color),
                 ft.Text(
-                    "Введите 4 опорные точки. Pх — координаты в кадре, "
-                    "мм — реальные координаты на рабочем поле.",
+                    "Введите 4 опорные точки или нажмите «Авто-определить» — "
+                    "программа найдёт точки по эталонному паттерну "
+                    "(шахматная доска / сетка кругов) на текущем кадре.",
                     size=11, color=ft.Colors.WHITE54,
                 ),
                 ft.Container(height=4),
@@ -2752,6 +2981,11 @@ async def main(page: ft.Page) -> None:
         )
 
         actions = [
+            ft.OutlinedButton(
+                content=ft.Text("Авто-определить"),
+                icon=ft.Icons.AUTO_AWESOME,
+                on_click=_open_auto_detect,
+            ),
             ft.OutlinedButton(content=ft.Text("Вычислить"),
                               icon=ft.Icons.CALCULATE, on_click=_compute),
             ft.Button(content=ft.Text("Сохранить и применить"),

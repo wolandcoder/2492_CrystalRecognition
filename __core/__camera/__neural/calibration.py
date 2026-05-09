@@ -208,3 +208,281 @@ def disable_calibration(config_path: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+@dataclass
+class AutoDetectResult:
+    """Результат автоопределения опорных точек.
+
+    Все обнаруженные точки уже сопоставлены с мировыми координатами
+    в системе паттерна (x — столбцы, y — строки), origin в верхнем-левом углу.
+    """
+    pattern: str
+    points: list[CalibrationPoint]
+    cols: int
+    rows: int
+    image_size: tuple[int, int]
+    notes: str = ""
+
+    @property
+    def corner_points(self) -> list[CalibrationPoint]:
+        """4 угла паттерна: TL, TR, BR, BL (для предпросмотра в UI)."""
+        if not self.points:
+            return []
+        if self.cols < 2 or self.rows < 2:
+            return list(self.points[:4])
+        c, r = self.cols, self.rows
+        idx_tl = 0
+        idx_tr = c - 1
+        idx_br = r * c - 1
+        idx_bl = (r - 1) * c
+        return [
+            self.points[idx_tl], self.points[idx_tr],
+            self.points[idx_br], self.points[idx_bl],
+        ]
+
+
+def _build_world_grid(
+    cols: int, rows: int, spacing_mm: float, origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> list[tuple[float, float]]:
+    """Сгенерировать сетку мировых координат row-major (как cv2 возвращает)."""
+    return [
+        (origin_x + c * spacing_mm, origin_y + r * spacing_mm)
+        for r in range(rows)
+        for c in range(cols)
+    ]
+
+
+def detect_chessboard(
+    frame: np.ndarray,
+    pattern_size: tuple[int, int] = (9, 6),
+    square_mm: float = 5.0,
+    *,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> AutoDetectResult | None:
+    """Автоопределение углов шахматной доски.
+
+    ``pattern_size`` — число *внутренних* углов (cols, rows), а не клеток.
+    Стандартная доска 10×7 клеток имеет ``pattern_size=(9, 6)``.
+    """
+    if frame is None or frame.size == 0:
+        return None
+    gray = (
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if frame.ndim == 3 else frame
+    )
+
+    flags = (
+        cv2.CALIB_CB_ADAPTIVE_THRESH
+        + cv2.CALIB_CB_NORMALIZE_IMAGE
+        + cv2.CALIB_CB_FAST_CHECK
+    )
+    found, corners = cv2.findChessboardCorners(
+        gray, pattern_size, flags=flags,
+    )
+    if not found or corners is None:
+        return None
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01,
+    )
+    corners = cv2.cornerSubPix(
+        gray, corners, (11, 11), (-1, -1), criteria,
+    )
+
+    cols, rows = pattern_size
+    world = _build_world_grid(cols, rows, square_mm, origin_x, origin_y)
+    pts: list[CalibrationPoint] = []
+    for i, (wx, wy) in enumerate(world):
+        cx, cy = corners[i, 0]
+        pts.append(CalibrationPoint(
+            px_x=float(cx), px_y=float(cy),
+            world_x=float(wx), world_y=float(wy),
+            label=f"CB{i}",
+        ))
+    return AutoDetectResult(
+        pattern="chessboard",
+        points=pts, cols=cols, rows=rows,
+        image_size=(gray.shape[1], gray.shape[0]),
+        notes=f"square={square_mm}mm",
+    )
+
+
+def detect_circles_grid(
+    frame: np.ndarray,
+    pattern_size: tuple[int, int] = (4, 11),
+    spacing_mm: float = 5.0,
+    *,
+    asymmetric: bool = True,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> AutoDetectResult | None:
+    """Автоопределение сетки кругов.
+
+    Поддерживает симметричную и асимметричную раскладку. Симметричная сетка
+    проще в печати, асимметричная — точнее по углу поворота.
+    """
+    if frame is None or frame.size == 0:
+        return None
+    gray = (
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if frame.ndim == 3 else frame
+    )
+
+    flags = (
+        cv2.CALIB_CB_ASYMMETRIC_GRID
+        if asymmetric
+        else cv2.CALIB_CB_SYMMETRIC_GRID
+    )
+    found, centers = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
+    if not found or centers is None:
+        return None
+
+    cols, rows = pattern_size
+    if asymmetric:
+        # Asymmetric grid: каждая чётная строка сдвинута на пол-шага
+        pts: list[CalibrationPoint] = []
+        idx = 0
+        for r in range(rows):
+            for c in range(cols):
+                cx, cy = centers[idx, 0]
+                wx = origin_x + (2 * c + (r % 2)) * spacing_mm
+                wy = origin_y + r * spacing_mm
+                pts.append(CalibrationPoint(
+                    px_x=float(cx), px_y=float(cy),
+                    world_x=float(wx), world_y=float(wy),
+                    label=f"AG{idx}",
+                ))
+                idx += 1
+    else:
+        world = _build_world_grid(cols, rows, spacing_mm, origin_x, origin_y)
+        pts = []
+        for i, (wx, wy) in enumerate(world):
+            cx, cy = centers[i, 0]
+            pts.append(CalibrationPoint(
+                px_x=float(cx), px_y=float(cy),
+                world_x=float(wx), world_y=float(wy),
+                label=f"SG{i}",
+            ))
+
+    return AutoDetectResult(
+        pattern="circles_asymmetric" if asymmetric else "circles_symmetric",
+        points=pts, cols=cols, rows=rows,
+        image_size=(gray.shape[1], gray.shape[0]),
+        notes=f"spacing={spacing_mm}mm",
+    )
+
+
+def detect_aruco_markers(
+    frame: np.ndarray,
+    marker_world_coords: dict[int, tuple[float, float]] | None = None,
+    *,
+    dictionary_id: int | None = None,
+) -> AutoDetectResult | None:
+    """Автоопределение ArUco-маркеров.
+
+    ``marker_world_coords`` — словарь {id: (mm_x, mm_y)} с известными мировыми
+    координатами центров маркеров. Если None — координаты не сопоставляются
+    и вернётся None (точки без мировых координат бесполезны для калибровки).
+
+    Если в OpenCV не подключён ``cv2.aruco`` (нет opencv-contrib), вернёт None.
+    """
+    if frame is None or frame.size == 0:
+        return None
+    aruco = getattr(cv2, "aruco", None)
+    if aruco is None:
+        return None
+    if not marker_world_coords:
+        return None
+
+    gray = (
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if frame.ndim == 3 else frame
+    )
+    if dictionary_id is None:
+        dictionary_id = getattr(aruco, "DICT_4X4_50", 0)
+    try:
+        if hasattr(aruco, "Dictionary_get"):
+            dictionary = aruco.Dictionary_get(dictionary_id)
+            params = aruco.DetectorParameters_create()
+            corners, ids, _ = aruco.detectMarkers(gray, dictionary, parameters=params)
+        else:
+            dictionary = aruco.getPredefinedDictionary(dictionary_id)
+            params = aruco.DetectorParameters()
+            detector = aruco.ArucoDetector(dictionary, params)
+            corners, ids, _ = detector.detectMarkers(gray)
+    except Exception as exc:
+        log.warning("aruco detection failed: %s", exc)
+        return None
+
+    if ids is None or len(ids) == 0:
+        return None
+
+    pts: list[CalibrationPoint] = []
+    for i, marker_id in enumerate(ids.flatten()):
+        if int(marker_id) not in marker_world_coords:
+            continue
+        c = corners[i].reshape(4, 2)
+        cx = float(c[:, 0].mean())
+        cy = float(c[:, 1].mean())
+        wx, wy = marker_world_coords[int(marker_id)]
+        pts.append(CalibrationPoint(
+            px_x=cx, px_y=cy,
+            world_x=float(wx), world_y=float(wy),
+            label=f"ID{int(marker_id)}",
+        ))
+
+    if len(pts) < 4:
+        return None
+
+    return AutoDetectResult(
+        pattern="aruco",
+        points=pts, cols=0, rows=0,
+        image_size=(gray.shape[1], gray.shape[0]),
+        notes=f"matched={len(pts)}",
+    )
+
+
+def auto_detect_pattern(
+    frame: np.ndarray,
+    *,
+    chessboard_size: tuple[int, int] = (9, 6),
+    chessboard_square_mm: float = 5.0,
+    circles_size: tuple[int, int] = (4, 11),
+    circles_spacing_mm: float = 5.0,
+    circles_asymmetric: bool = True,
+    aruco_world_coords: dict[int, tuple[float, float]] | None = None,
+) -> AutoDetectResult | None:
+    """Универсальный автодетектор: пробует все известные паттерны по порядку.
+
+    Порядок: chessboard → asym circles → sym circles → aruco.
+    Возвращает первый успешный результат.
+    """
+    res = detect_chessboard(
+        frame, chessboard_size, chessboard_square_mm,
+    )
+    if res is not None:
+        return res
+
+    res = detect_circles_grid(
+        frame, circles_size, circles_spacing_mm,
+        asymmetric=True,
+    )
+    if res is not None:
+        return res
+
+    res = detect_circles_grid(
+        frame, circles_size, circles_spacing_mm,
+        asymmetric=False,
+    )
+    if res is not None:
+        return res
+
+    if aruco_world_coords:
+        res = detect_aruco_markers(frame, aruco_world_coords)
+        if res is not None:
+            return res
+
+    return None
