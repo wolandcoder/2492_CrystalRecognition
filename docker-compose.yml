@@ -1,0 +1,72 @@
+version: "3.8"
+
+services:
+  # Основной сервис — GUI приложения для захвата кристаллов
+  crystal-gui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: bolhov/crystal-recognition:latest
+    container_name: bolhov-crystal-gui
+    restart: unless-stopped
+    network_mode: host
+    privileged: false
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - PYTHONUNBUFFERED=1
+      - LANG=ru_RU.UTF-8
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/home/app/.Xauthority:rw
+      - ./config.json:/app/config.json:rw
+      - ./VIDEOS_TESTS:/app/VIDEOS_TESTS:ro
+      - captures:/app/captures
+    devices:
+      - /dev/video0:/dev/video0
+    depends_on:
+      - mach3-server
+    command: ["python3", "gui.py"]
+
+  # Имитатор Mach3 (для разработки без станка)
+  mach3-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: bolhov/crystal-recognition:latest
+    container_name: bolhov-mach3-imitation
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      - PYTHONUNBUFFERED=1
+    working_dir: /app/__core/__movement/moch3_lib
+    command: ["python3", "mach3_server_imitation.py"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 5555), timeout=2); s.close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # CLI-просмотрщик без GUI (для отладки видеопотока на сервере)
+  crystal-viewer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: bolhov/crystal-recognition:latest
+    container_name: bolhov-crystal-viewer
+    profiles: ["debug"]
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./VIDEOS_TESTS:/app/VIDEOS_TESTS:ro
+    command: ["python3", "main.py", "view"]
+
+volumes:
+  captures:
+    driver: local

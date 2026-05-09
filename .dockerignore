@@ -1,0 +1,53 @@
+# Файлы и директории, не нужные внутри Docker-образа
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+
+.git/
+.gitignore
+.gitattributes
+
+.venv/
+venv/
+env/
+.cursor/
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.flet/
+
+.DS_Store
+Thumbs.db
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# Большие тестовые видео (монтируются как volume)
+VIDEOS_TESTS/
+captures/
+
+# Документация — не нужна в runtime
+*.md
+README*
+docs/
+
+# Тесты библиотеки Mach3 (запускаются отдельно)
+__core/__movement/moch3_lib/test.py
+
+# Docker-файлы (рекурсивная сборка не нужна)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Node-артефакты, если будут
+node_modules/
+package-lock.json

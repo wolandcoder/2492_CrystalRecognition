@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 
 import cv2
 import numpy as np
@@ -32,15 +33,19 @@ class _Det:
 
 
 class _Track:
-                                                                  
-                                             
     SIDE_EMA = 0.08
     HYST_BAND = 0.12
+
+    HISTORY_SIZE = 8
+    PREDICT_BLEND = 0.7
+    MAX_PREDICT_FRAMES = 5
+    VEL_DAMPING = 0.92
 
     __slots__ = (
         "tid", "cx", "cy", "w", "h", "angle", "kind",
         "hits", "misses", "age", "confirmed",
         "_sin2", "_cos2", "_top_ema",
+        "_history", "_vx", "_vy", "_predicted",
     )
 
     _next_id: int = 0
@@ -62,8 +67,15 @@ class _Track:
         self.misses = 0
         self.age = 1
         self.confirmed = False
+        self._history: deque[tuple[float, float]] = deque(
+            [(det.cx, det.cy)], maxlen=self.HISTORY_SIZE,
+        )
+        self._vx = 0.0
+        self._vy = 0.0
+        self._predicted = False
 
     def update(self, det: _Det, s: float) -> None:
+        prev_cx, prev_cy = self.cx, self.cy
         self.cx = s * self.cx + (1 - s) * det.cx
         self.cy = s * self.cy + (1 - s) * det.cy
         s_wh = min(0.88, s + 0.28)
@@ -79,7 +91,6 @@ class _Track:
             self._cos2 = a_s * self._cos2 + (1 - a_s) * math.cos(r)
             self.angle = (math.degrees(math.atan2(self._sin2, self._cos2)) / 2) % 180
 
-                                                           
         alpha = self.SIDE_EMA
         self._top_ema = (1.0 - alpha) * self._top_ema + alpha * det.top_conf
         if self.kind == "top" and self._top_ema < 0.5 - self.HYST_BAND:
@@ -87,13 +98,63 @@ class _Track:
         elif self.kind == "bottom" and self._top_ema > 0.5 + self.HYST_BAND:
             self.kind = "top"
 
+        self._history.append((self.cx, self.cy))
+        self._update_velocity(prev_cx, prev_cy)
+
         self.hits += 1
         self.misses = 0
         self.age += 1
+        self._predicted = False
+
+    def _update_velocity(self, prev_cx: float, prev_cy: float) -> None:
+        vx_inst = self.cx - prev_cx
+        vy_inst = self.cy - prev_cy
+        beta = 0.4
+        self._vx = (1.0 - beta) * self._vx + beta * vx_inst
+        self._vy = (1.0 - beta) * self._vy + beta * vy_inst
 
     def mark_miss(self) -> None:
         self.misses += 1
         self.age += 1
+        if self.confirmed and self.misses <= self.MAX_PREDICT_FRAMES:
+            self._extrapolate()
+
+    def _extrapolate(self) -> None:
+        damping = self.VEL_DAMPING ** self.misses
+        pred_cx = self.cx + self._vx * damping
+        pred_cy = self.cy + self._vy * damping
+        self.cx = self.PREDICT_BLEND * pred_cx + (1.0 - self.PREDICT_BLEND) * self.cx
+        self.cy = self.PREDICT_BLEND * pred_cy + (1.0 - self.PREDICT_BLEND) * self.cy
+        self._predicted = True
+        self._vx *= damping
+        self._vy *= damping
+
+    def stability(self) -> float:
+        """Метрика стабильности трека [0..1].
+
+        Учитывает: возраст, miss-rate, дисперсию скорости.
+        Используется для фильтрации ненадёжных целей перед командой станку.
+        """
+        if self.hits < 2:
+            return 0.0
+        age_score = min(1.0, self.hits / 12.0)
+        miss_pen = max(0.0, 1.0 - self.misses / 6.0)
+        if len(self._history) >= 3:
+            xs = [p[0] for p in self._history]
+            ys = [p[1] for p in self._history]
+            dx = max(xs) - min(xs)
+            dy = max(ys) - min(ys)
+            spread = math.hypot(dx, dy)
+            speed = math.hypot(self._vx, self._vy)
+            jitter = max(0.0, spread - speed * len(self._history))
+            jitter_score = max(0.0, 1.0 - jitter / 40.0)
+        else:
+            jitter_score = 0.5
+        return float(0.4 * age_score + 0.3 * miss_pen + 0.3 * jitter_score)
+
+    @property
+    def is_predicted(self) -> bool:
+        return self._predicted
 
 
 def _rotated_box_pts(cx: float, cy: float, w: float, h: float, angle: float) -> np.ndarray:
@@ -243,14 +304,42 @@ class Mod(NeuralMod):
         self._update_tracks(dets)
 
         vis = [t for t in self._tracks if t.confirmed and t.misses == 0]
-        hold = [t for t in self._tracks if t.confirmed and 0 < t.misses <= self.HOLD_FRAMES]
+        hold = [
+            t for t in self._tracks
+            if t.confirmed and 0 < t.misses <= self.HOLD_FRAMES
+        ]
+        predicted = [
+            t for t in self._tracks
+            if t.confirmed and 0 < t.misses <= _Track.MAX_PREDICT_FRAMES
+            and t.is_predicted
+        ]
 
-        self._render(frame, vis, hold)
+        self._render(frame, vis, hold, predicted)
 
-        context.shared["particle_centers"] = [
-            {"cx": int(t.cx), "cy": int(t.cy), "w": int(t.w), "h": int(t.h),
-             "angle": round(t.angle, 1), "side": t.kind, "tid": t.tid}
-            for t in vis
+        out_centers: list[dict] = []
+        for t in vis:
+            out_centers.append({
+                "cx": int(t.cx), "cy": int(t.cy),
+                "w": int(t.w), "h": int(t.h),
+                "angle": round(t.angle, 1), "side": t.kind, "tid": t.tid,
+                "stability": round(t.stability(), 3),
+                "predicted": False,
+                "misses": t.misses,
+            })
+        for t in predicted:
+            out_centers.append({
+                "cx": int(t.cx), "cy": int(t.cy),
+                "w": int(t.w), "h": int(t.h),
+                "angle": round(t.angle, 1), "side": t.kind, "tid": t.tid,
+                "stability": round(t.stability() * 0.5, 3),
+                "predicted": True,
+                "misses": t.misses,
+            })
+
+        context.shared["particle_centers"] = out_centers
+        context.shared["particle_centers_stable"] = [
+            c for c in out_centers
+            if c["stability"] >= 0.5 and not c["predicted"]
         ]
         return frame
 
@@ -638,15 +727,29 @@ class Mod(NeuralMod):
     def _render(
         self, frame: np.ndarray,
         vis: list[_Track], hold: list[_Track],
+        predicted: list[_Track] | None = None,
     ) -> None:
         for t in vis:
             c = self.COLOR_TOP if t.kind == "top" else self.COLOR_BOTTOM
             self._draw_track(frame, t, c)
+        if predicted:
+            for t in predicted:
+                self._draw_predicted(frame, t)
         fh = frame.shape[0]
+        suffix = f"  (pred: {len(predicted)})" if predicted else ""
         cv2.putText(
-            frame, f"elements: {len(vis)}", (8, fh - 14),
+            frame, f"elements: {len(vis)}{suffix}", (8, fh - 14),
             self.FONT, 0.52, (220, 220, 220), 1, cv2.LINE_AA,
         )
+
+    def _draw_predicted(self, frame: np.ndarray, t: _Track) -> None:
+        """Рисует предсказанный трек пунктирной рамкой."""
+        box = _rotated_box_pts(t.cx, t.cy, t.w, t.h, t.angle)
+        for i in range(4):
+            p1 = tuple(box[i])
+            p2 = tuple(box[(i + 1) % 4])
+            mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+            cv2.line(frame, p1, mid, self.COLOR_HOLD, 1, cv2.LINE_AA)
 
     def _draw_track(
         self, frame: np.ndarray, t: _Track, color: tuple,

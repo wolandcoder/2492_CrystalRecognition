@@ -13,7 +13,10 @@ class FrameContext:
     frame_height: int
     frame_index: int
     overlay_line: int = 0
-                                                                  
+
+    timestamp_ms: float = 0.0
+    frame_age_ms: float = 0.0
+
     shared: dict[str, Any] = field(default_factory=dict)
 
     def reserve_text_lines(self, lines: int = 1) -> int:
@@ -27,3 +30,6 @@ class NeuralMod:
 
     def apply(self, frame: Any, context: FrameContext) -> Any:
         return frame
+
+    def shutdown(self) -> None:
+        return None

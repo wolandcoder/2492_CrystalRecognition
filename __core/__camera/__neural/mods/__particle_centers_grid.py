@@ -4,6 +4,11 @@ import cv2
 import numpy as np
 
 from ..base import FrameContext, NeuralMod
+from ..calibration import (
+    CalibrationResult,
+    PerspectiveCalibrator,
+    load_calibration,
+)
 
 
 class Mod(NeuralMod):
@@ -42,11 +47,35 @@ class Mod(NeuralMod):
 
     def __init__(self) -> None:
         self._cfg_loaded = False
+        self._calibration: CalibrationResult | None = None
+        self._use_perspective = False
+
+    def reload_calibration(self) -> bool:
+        """Перечитать калибровку из config.json (вызывается из GUI)."""
+        from pathlib import Path
+        try:
+            p = Path(__file__).resolve().parents[4] / "config.json"
+            cal = load_calibration(p)
+            if cal is not None:
+                self._calibration = cal
+                self._use_perspective = True
+                return True
+            self._use_perspective = False
+            return False
+        except Exception:
+            self._use_perspective = False
+            return False
 
     def apply(self, frame: object, context: FrameContext) -> object:
         if not self._cfg_loaded:
             self._load_cfg(context)
             self._cfg_loaded = True
+
+        context.shared["_grid_use_perspective"] = self._use_perspective
+        if self._calibration is not None:
+            context.shared["_grid_calibration_rms"] = round(
+                self._calibration.rms_error_mm, 3,
+            )
 
         h, w = frame.shape[:2]
         cx_frame, cy_frame = w / 2.0, h / 2.0
@@ -76,6 +105,10 @@ class Mod(NeuralMod):
             if p.exists():
                 raw = json.loads(p.read_text("utf-8"))
                 cfg = raw.get("particle_grid", {})
+                cal = load_calibration(p)
+                if cal is not None:
+                    self._calibration = cal
+                    self._use_perspective = True
         except Exception:
             pass
 
@@ -123,6 +156,10 @@ class Mod(NeuralMod):
         self, px_x: float, px_y: float,
         cx_frame: float, cy_frame: float,
     ) -> tuple[float, float]:
+        if self._use_perspective and self._calibration is not None:
+            return PerspectiveCalibrator.apply(
+                self._calibration.matrix, px_x, px_y,
+            )
         dx = (px_x - cx_frame) * self.SCALE_X + self.ORIGIN_OFFSET_X
         dy = (px_y - cy_frame) * self.SCALE_Y + self.ORIGIN_OFFSET_Y
         if self.INVERT_Y:
@@ -133,6 +170,11 @@ class Mod(NeuralMod):
         self, wx: float, wy: float,
         cx_frame: float, cy_frame: float,
     ) -> tuple[int, int]:
+        if self._use_perspective and self._calibration is not None:
+            px_x, px_y = PerspectiveCalibrator.apply_inverse(
+                self._calibration.inverse_matrix, wx, wy,
+            )
+            return int(round(px_x)), int(round(px_y))
         dy = -wy if self.INVERT_Y else wy
         px_x = (wx - self.ORIGIN_OFFSET_X) / self.SCALE_X + cx_frame
         px_y = (dy - self.ORIGIN_OFFSET_Y) / self.SCALE_Y + cy_frame
@@ -142,8 +184,24 @@ class Mod(NeuralMod):
         self, p: dict, cx_frame: float, cy_frame: float,
     ) -> dict:
         wx, wy = self._px_to_world(p["cx"], p["cy"], cx_frame, cy_frame)
-        ww = p["w"] * self.SCALE_X
-        wh = p["h"] * self.SCALE_Y
+        if self._use_perspective and self._calibration is not None:
+            wx_r, _ = self._px_to_world(
+                p["cx"] + p["w"] * 0.5, p["cy"], cx_frame, cy_frame,
+            )
+            wx_l, _ = self._px_to_world(
+                p["cx"] - p["w"] * 0.5, p["cy"], cx_frame, cy_frame,
+            )
+            _, wy_t = self._px_to_world(
+                p["cx"], p["cy"] - p["h"] * 0.5, cx_frame, cy_frame,
+            )
+            _, wy_b = self._px_to_world(
+                p["cx"], p["cy"] + p["h"] * 0.5, cx_frame, cy_frame,
+            )
+            ww = abs(wx_r - wx_l)
+            wh = abs(wy_t - wy_b)
+        else:
+            ww = p["w"] * self.SCALE_X
+            wh = p["h"] * self.SCALE_Y
         return {
             "tid": p["tid"],
             "x": round(wx, 2), "y": round(wy, 2),
