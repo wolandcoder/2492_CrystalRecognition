@@ -2557,8 +2557,9 @@ async def main(page: ft.Page) -> None:
         """
         from __core.__camera.__neural.calibration import (
             AutoDetectResult, CalibrationPoint, CalibrationResult,
-            PerspectiveCalibrator, auto_detect_pattern, detect_chessboard,
-            detect_circles_grid, disable_calibration, save_calibration,
+            PerspectiveCalibrator, auto_detect_pattern,
+            find_chessboard_any_size, find_circles_grid_any_size,
+            disable_calibration, save_calibration,
         )
         from pathlib import Path as _Path
 
@@ -2726,52 +2727,51 @@ async def main(page: ft.Page) -> None:
                 await _do_start()
 
         def _open_auto_detect(_) -> None:
-            """Подменю автоопределения опорных точек по эталонному паттерну."""
+            """Авто-определение опорных точек.
+
+            Нужен один параметр — шаг сетки в миллиметрах. Тип паттерна
+            и размер программа определяет сама: перебирает все стандартные
+            размеры шахматной доски, асимметричной и симметричной сетки
+            кругов, для каждого размера применяет несколько препроцессингов
+            (CLAHE / инверсия / blur / adaptive threshold) — это покрывает
+            плохое освещение, блики, разные ориентации и яркость паттерна.
+            """
             pattern_dd = ft.Dropdown(
-                width=240, dense=True,
-                value="chessboard",
+                width=260, dense=True,
+                value="auto",
                 options=[
-                    ft.dropdown.Option("chessboard", "Шахматная доска"),
+                    ft.dropdown.Option("auto", "Авто (любой паттерн)"),
+                    ft.dropdown.Option("chessboard", "Только шахматная доска"),
                     ft.dropdown.Option(
-                        "circles_asymmetric", "Сетка кругов (асим.)",
+                        "circles_asymmetric",
+                        "Только круги (асимметричные)",
                     ),
                     ft.dropdown.Option(
-                        "circles_symmetric", "Сетка кругов (сим.)",
+                        "circles_symmetric",
+                        "Только круги (симметричные)",
                     ),
-                    ft.dropdown.Option("auto", "Авто (любой)"),
                 ],
-                label="Паттерн",
+                label="Тип паттерна",
             )
 
-            cols_tf = ft.TextField(
-                width=80, dense=True, height=38, text_size=12,
-                value="9", label="cols",
-                keyboard_type=ft.KeyboardType.NUMBER,
-            )
-            rows_tf = ft.TextField(
-                width=80, dense=True, height=38, text_size=12,
-                value="6", label="rows",
-                keyboard_type=ft.KeyboardType.NUMBER,
-            )
             spacing_tf = ft.TextField(
-                width=110, dense=True, height=38, text_size=12,
-                value="5.0", label="шаг, мм",
+                width=160, dense=True, height=42, text_size=13,
+                value="5.0", label="Шаг сетки, мм",
                 keyboard_type=ft.KeyboardType.NUMBER,
             )
 
             hint = ft.Text(
-                "Шахматная доска: cols/rows — число *внутренних* углов "
-                "(для доски 10×7 клеток это 9×6). Шаг — длина клетки в мм.",
+                "Положите эталонный паттерн в поле зрения камеры и нажмите "
+                "«Найти». Размер паттерна определяется автоматически — "
+                "указывать cols/rows не нужно.",
                 size=11, color=ft.Colors.WHITE54,
-                width=420,
+                width=460,
             )
             ad_status = ft.Text("", size=12, selectable=True)
-
-            def _read_int(tf: ft.TextField, default: int) -> int:
-                try:
-                    return int((tf.value or "").strip())
-                except (ValueError, TypeError):
-                    return default
+            ad_progress = ft.ProgressBar(
+                width=460, value=0.0, visible=False, height=3,
+            )
+            detect_btn_holder: dict = {"btn": None}
 
             def _read_float(tf: ft.TextField, default: float) -> float:
                 try:
@@ -2779,39 +2779,26 @@ async def main(page: ft.Page) -> None:
                 except (ValueError, TypeError):
                     return default
 
-            def _on_pattern_change(_ev) -> None:
-                p = pattern_dd.value
-                if p == "chessboard":
-                    cols_tf.value, rows_tf.value = "9", "6"
-                    spacing_tf.label = "клетка, мм"
-                    hint.value = (
-                        "Шахматная доска: cols/rows — число *внутренних* углов "
-                        "(для доски 10×7 клеток это 9×6). Шаг — длина клетки в мм."
-                    )
-                elif p == "circles_asymmetric":
-                    cols_tf.value, rows_tf.value = "4", "11"
-                    spacing_tf.label = "шаг, мм"
-                    hint.value = (
-                        "Асимметричная сетка кругов: точнее по углу поворота. "
-                        "По умолчанию 4×11 (стандартный шаблон OpenCV)."
-                    )
-                elif p == "circles_symmetric":
-                    cols_tf.value, rows_tf.value = "7", "5"
-                    spacing_tf.label = "шаг, мм"
-                    hint.value = (
-                        "Симметричная сетка кругов: проще распечатать. "
-                        "Укажите число кругов по столбцам и строкам."
-                    )
-                else:
-                    hint.value = (
-                        "Программа последовательно попробует все паттерны и "
-                        "выберет первый, который удастся обнаружить."
-                    )
+            def _set_busy(busy: bool) -> None:
+                ad_progress.visible = busy
+                btn = detect_btn_holder.get("btn")
+                if btn is not None:
+                    btn.disabled = busy
                 page.update()
 
-            pattern_dd.on_change = _on_pattern_change
+            def _progress_cb_factory():
+                """Колбэк прогресса от детектора (вызывается из фон. потока)."""
+                def _cb(idx: int, total: int, label: str) -> None:
+                    try:
+                        ad_status.value = f"Поиск: {label} ({idx + 1}/{total})"
+                        ad_status.color = ft.Colors.WHITE70
+                        ad_progress.value = (idx + 1) / max(1, total)
+                        page.update()
+                    except Exception:
+                        pass
+                return _cb
 
-            def _do_detect(_) -> None:
+            async def _do_detect(_) -> None:
                 frame = engine.last_raw_frame
                 if frame is None:
                     ad_status.value = (
@@ -2822,48 +2809,66 @@ async def main(page: ft.Page) -> None:
                     return
 
                 p = pattern_dd.value
-                cols = _read_int(cols_tf, 9)
-                rows = _read_int(rows_tf, 6)
                 spacing = _read_float(spacing_tf, 5.0)
-
-                ad_status.value = "Идёт поиск паттерна…"
-                ad_status.color = ft.Colors.WHITE70
-                page.update()
-
-                detect_res: AutoDetectResult | None = None
-                try:
-                    if p == "chessboard":
-                        detect_res = detect_chessboard(
-                            frame, (cols, rows), spacing,
-                        )
-                    elif p == "circles_asymmetric":
-                        detect_res = detect_circles_grid(
-                            frame, (cols, rows), spacing, asymmetric=True,
-                        )
-                    elif p == "circles_symmetric":
-                        detect_res = detect_circles_grid(
-                            frame, (cols, rows), spacing, asymmetric=False,
-                        )
-                    else:
-                        detect_res = auto_detect_pattern(
-                            frame,
-                            chessboard_size=(cols, rows),
-                            chessboard_square_mm=spacing,
-                            circles_size=(cols, rows),
-                            circles_spacing_mm=spacing,
-                        )
-                except Exception as ex:
-                    ad_status.value = f"Ошибка детектора: {ex}"
+                if spacing <= 0:
+                    ad_status.value = "Шаг должен быть положительным числом."
                     ad_status.color = ft.Colors.RED_300
                     page.update()
                     return
 
+                _set_busy(True)
+                ad_status.value = "Идёт поиск паттерна…"
+                ad_status.color = ft.Colors.WHITE70
+                page.update()
+
+                # Снимок кадра (на случай, если поток обновит его во время работы)
+                frame_snap = frame.copy()
+
+                progress_cb = _progress_cb_factory()
+
+                def _run_detection() -> AutoDetectResult | None:
+                    try:
+                        if p == "chessboard":
+                            return find_chessboard_any_size(
+                                frame_snap, square_mm=spacing,
+                                progress=progress_cb,
+                            )
+                        if p == "circles_asymmetric":
+                            return find_circles_grid_any_size(
+                                frame_snap, spacing_mm=spacing,
+                                asymmetric=True, progress=progress_cb,
+                            )
+                        if p == "circles_symmetric":
+                            return find_circles_grid_any_size(
+                                frame_snap, spacing_mm=spacing,
+                                asymmetric=False, progress=progress_cb,
+                            )
+                        return auto_detect_pattern(
+                            frame_snap, spacing_mm=spacing,
+                            progress=progress_cb,
+                        )
+                    except Exception:
+                        log.exception("auto-detect failed")
+                        return None
+
+                try:
+                    detect_res = await asyncio.to_thread(_run_detection)
+                except Exception:
+                    log.exception("asyncio.to_thread failed")
+                    detect_res = None
+
+                _set_busy(False)
+
                 if detect_res is None or not detect_res.points:
                     ad_status.value = (
-                        "Паттерн не найден. Проверьте: видна ли доска целиком, "
-                        "освещение, нет ли бликов, верны ли cols/rows."
+                        "Паттерн не найден. Возможные причины:\n"
+                        "• доска не видна целиком в кадре\n"
+                        "• сильные блики или тени на паттерне\n"
+                        "• низкий контраст / расфокус\n"
+                        "• в кадре нестандартный паттерн (попробуйте сменить тип)"
                     )
                     ad_status.color = ft.Colors.RED_300
+                    ad_progress.value = 0.0
                     page.update()
                     return
 
@@ -2878,34 +2883,46 @@ async def main(page: ft.Page) -> None:
                 autodetect_state["result"] = res
                 _fill_from_corners(detect_res.corner_points)
 
-                page.pop_dialog()  # close auto-detect sub-dialog
+                page.pop_dialog()
+                pat_label = {
+                    "chessboard": "шахматная доска",
+                    "circles_asymmetric": "круги (асим.)",
+                    "circles_symmetric": "круги (сим.)",
+                    "aruco": "ArUco",
+                }.get(detect_res.pattern, detect_res.pattern)
                 result_text.value = (
-                    f"Авто-{detect_res.pattern}: найдено "
-                    f"{len(detect_res.points)} точек, "
+                    f"Найден паттерн «{pat_label}» {detect_res.cols}×"
+                    f"{detect_res.rows} ({len(detect_res.points)} точек), "
                     f"RMS = {res.rms_error_mm:.4f} мм. "
                     f"Нажмите «Сохранить и применить»."
                 )
                 result_text.color = ft.Colors.GREEN_300
                 page.update()
 
+            detect_btn = ft.Button(
+                content=ft.Text("Найти на текущем кадре"),
+                icon=ft.Icons.CENTER_FOCUS_STRONG,
+                on_click=_do_detect,
+            )
+            detect_btn_holder["btn"] = detect_btn
+
             sub_dlg = ft.AlertDialog(
                 title=ft.Row(controls=[
                     ft.Icon(ft.Icons.AUTO_AWESOME,
                               color=ft.Colors.AMBER_300, size=20),
-                    ft.Text("Авто-определение по паттерну",
+                    ft.Text("Авто-определение опорных точек",
                               weight=ft.FontWeight.BOLD),
                 ], spacing=8),
                 content=ft.Column(controls=[
                     pattern_dd,
-                    ft.Row(controls=[cols_tf, rows_tf, spacing_tf], spacing=8),
+                    spacing_tf,
                     hint,
                     ft.Container(height=4),
+                    ad_progress,
                     ad_status,
-                ], spacing=10, tight=True, width=460),
+                ], spacing=10, tight=True, width=480),
                 actions=[
-                    ft.Button(content=ft.Text("Найти на текущем кадре"),
-                              icon=ft.Icons.CENTER_FOCUS_STRONG,
-                              on_click=_do_detect),
+                    detect_btn,
                     ft.OutlinedButton(content=ft.Text("Отмена"),
                                       on_click=lambda _: (
                                           page.pop_dialog(), page.update())),

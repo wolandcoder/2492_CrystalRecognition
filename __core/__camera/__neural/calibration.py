@@ -13,6 +13,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -254,6 +255,109 @@ def _build_world_grid(
     ]
 
 
+# --- Препроцессинг: несколько вариантов изображения для повышения шансов ---
+# Реальные кадры с производства часто имеют блики, неравномерное освещение,
+# шум — поэтому пробуем несколько препроцессингов и для каждого запускаем
+# детектор; первый успех останавливает перебор.
+
+def _preprocess_variants(frame: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """Вернуть список (label, gray_image) для перебора детектором."""
+    if frame is None or frame.size == 0:
+        return []
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame.copy()
+
+    out: list[tuple[str, np.ndarray]] = [("orig", gray)]
+
+    # CLAHE — выравнивание гистограммы по плиткам (защита от теней/бликов)
+    try:
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        out.append(("clahe", clahe.apply(gray)))
+    except Exception:
+        pass
+
+    # Инверсия — на случай светлого паттерна на тёмном фоне
+    out.append(("inv", cv2.bitwise_not(gray)))
+
+    # Лёгкое размытие — гасит мелкий шум
+    try:
+        out.append(("blur", cv2.GaussianBlur(gray, (3, 3), 0)))
+    except Exception:
+        pass
+
+    # Адаптивная бинаризация — выделяет границы при неравномерном освещении
+    try:
+        th = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 21, 5,
+        )
+        out.append(("adaptive", th))
+    except Exception:
+        pass
+
+    return out
+
+
+# Стандартные размеры шахматных досок: число *внутренних* углов (cols, rows).
+# Порядок: самые распространённые сначала, маленькие в конце — чтобы
+# подмножество большого паттерна не «закрывало» полную доску раньше времени.
+_CHESSBOARD_CANDIDATES: tuple[tuple[int, int], ...] = (
+    (9, 6),  # самый распространённый — печатается на A4
+    (8, 6), (10, 7), (11, 8), (12, 9), (13, 10), (14, 11), (15, 12),
+    (7, 5), (8, 5), (10, 6), (11, 7), (12, 8),
+    (7, 7), (8, 8), (9, 9),
+    (6, 4), (5, 4), (4, 3),
+    (6, 6), (5, 5), (4, 4),
+    (3, 3),  # последний шанс
+)
+
+_CIRCLES_ASYM_CANDIDATES: tuple[tuple[int, int], ...] = (
+    (4, 11),  # стандарт OpenCV asymmetric
+    (3, 9), (5, 13), (4, 9), (3, 7), (5, 11), (6, 13),
+)
+
+_CIRCLES_SYM_CANDIDATES: tuple[tuple[int, int], ...] = (
+    (7, 5), (4, 4), (5, 5), (6, 6), (8, 5), (3, 3),
+    (9, 6), (5, 4), (6, 4),
+)
+
+
+def _try_chessboard(
+    gray: np.ndarray, pattern_size: tuple[int, int],
+) -> np.ndarray | None:
+    """Попытка детектировать углы доски заданного размера.
+
+    Сначала пытаемся современным findChessboardCornersSB (если есть в OpenCV);
+    он robust к плохому освещению и не требует CLAHE. Иначе — классический
+    findChessboardCorners + cornerSubPix.
+    """
+    sb = getattr(cv2, "findChessboardCornersSB", None)
+    if sb is not None:
+        try:
+            found, corners = sb(gray, pattern_size)
+            if found and corners is not None:
+                return corners
+        except Exception:
+            pass
+
+    flags = (
+        cv2.CALIB_CB_ADAPTIVE_THRESH
+        + cv2.CALIB_CB_NORMALIZE_IMAGE
+        + cv2.CALIB_CB_FAST_CHECK
+    )
+    found, corners = cv2.findChessboardCorners(gray, pattern_size, flags=flags)
+    if not found or corners is None:
+        return None
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01,
+    )
+    return cv2.cornerSubPix(
+        gray, corners, (11, 11), (-1, -1), criteria,
+    )
+
+
 def detect_chessboard(
     frame: np.ndarray,
     pattern_size: tuple[int, int] = (9, 6),
@@ -262,37 +366,40 @@ def detect_chessboard(
     origin_x: float = 0.0,
     origin_y: float = 0.0,
 ) -> AutoDetectResult | None:
-    """Автоопределение углов шахматной доски.
+    """Автоопределение углов шахматной доски (фиксированный pattern_size).
 
-    ``pattern_size`` — число *внутренних* углов (cols, rows), а не клеток.
-    Стандартная доска 10×7 клеток имеет ``pattern_size=(9, 6)``.
+    Использует все варианты препроцессинга. ``pattern_size`` — число
+    *внутренних* углов (cols, rows). Стандартная доска 10×7 клеток имеет
+    ``pattern_size=(9, 6)``.
     """
-    if frame is None or frame.size == 0:
+    variants = _preprocess_variants(frame)
+    if not variants:
         return None
-    gray = (
-        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if frame.ndim == 3 else frame
-    )
-
-    flags = (
-        cv2.CALIB_CB_ADAPTIVE_THRESH
-        + cv2.CALIB_CB_NORMALIZE_IMAGE
-        + cv2.CALIB_CB_FAST_CHECK
-    )
-    found, corners = cv2.findChessboardCorners(
-        gray, pattern_size, flags=flags,
-    )
-    if not found or corners is None:
-        return None
-
-    criteria = (
-        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01,
-    )
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1), criteria,
-    )
 
     cols, rows = pattern_size
+    used_label = ""
+    corners = None
+    for label, gray in variants:
+        c = _try_chessboard(gray, pattern_size)
+        if c is not None:
+            corners = c
+            used_label = label
+            break
+    if corners is None:
+        return None
+
+    # Финальный subpix всегда по оригиналу — даёт точность выше
+    base_gray = variants[0][1]
+    try:
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01,
+        )
+        corners = cv2.cornerSubPix(
+            base_gray, corners, (11, 11), (-1, -1), criteria,
+        )
+    except Exception:
+        pass
+
     world = _build_world_grid(cols, rows, square_mm, origin_x, origin_y)
     pts: list[CalibrationPoint] = []
     for i, (wx, wy) in enumerate(world):
@@ -305,45 +412,137 @@ def detect_chessboard(
     return AutoDetectResult(
         pattern="chessboard",
         points=pts, cols=cols, rows=rows,
-        image_size=(gray.shape[1], gray.shape[0]),
-        notes=f"square={square_mm}mm",
+        image_size=(base_gray.shape[1], base_gray.shape[0]),
+        notes=f"square={square_mm}mm pre={used_label}",
     )
 
 
-def detect_circles_grid(
+def _bbox_coverage(
+    corners: np.ndarray, image_w: int, image_h: int,
+) -> float:
+    """Доля площади кадра, занятая bounding box найденного паттерна (0..1)."""
+    pts = corners.reshape(-1, 2)
+    if pts.size == 0 or image_w <= 0 or image_h <= 0:
+        return 0.0
+    x_min, y_min = pts.min(axis=0)
+    x_max, y_max = pts.max(axis=0)
+    bw = max(0.0, float(x_max - x_min))
+    bh = max(0.0, float(y_max - y_min))
+    return (bw * bh) / float(image_w * image_h)
+
+
+_MIN_PATTERN_COVERAGE = 0.04  # минимум 4% площади кадра
+
+
+def find_chessboard_any_size(
     frame: np.ndarray,
-    pattern_size: tuple[int, int] = (4, 11),
-    spacing_mm: float = 5.0,
+    square_mm: float = 5.0,
     *,
-    asymmetric: bool = True,
+    candidates: tuple[tuple[int, int], ...] | None = None,
     origin_x: float = 0.0,
     origin_y: float = 0.0,
+    progress: Callable[[int, int, str], None] | None = None,
+    min_coverage: float = _MIN_PATTERN_COVERAGE,
 ) -> AutoDetectResult | None:
-    """Автоопределение сетки кругов.
+    """Перебор популярных размеров шахматной доски без указания cols/rows.
 
-    Поддерживает симметричную и асимметричную раскладку. Симметричная сетка
-    проще в печати, асимметричная — точнее по углу поворота.
+    Стратегия: проходим список кандидатов, для каждого пробуем все варианты
+    препроцессинга. Принимается *первый* размер, у которого:
+
+      - детекция прошла на каком-то препроцессинге, И
+      - bbox найденных углов покрывает минимум ``min_coverage`` площади кадра.
+
+    Это защищает от ложного срабатывания на подмножестве большего паттерна
+    (например, 3×3 в углу 9×6 доски) — такие фрагменты обычно занимают <4%
+    кадра и отсеиваются.
     """
-    if frame is None or frame.size == 0:
+    variants = _preprocess_variants(frame)
+    if not variants:
         return None
-    gray = (
-        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if frame.ndim == 3 else frame
-    )
 
+    base_gray = variants[0][1]
+    H, W = base_gray.shape[:2]
+    sizes = candidates or _CHESSBOARD_CANDIDATES
+    total = len(sizes)
+
+    for idx, ps in enumerate(sizes):
+        if progress is not None:
+            try:
+                progress(idx, total, f"chessboard {ps[0]}x{ps[1]}")
+            except Exception:
+                pass
+        cols, rows = ps
+        if cols < 2 or rows < 2:
+            continue
+        for label, gray in variants:
+            corners = _try_chessboard(gray, ps)
+            if corners is None:
+                continue
+
+            cov = _bbox_coverage(corners, W, H)
+            if cov < min_coverage:
+                # Слишком маленький паттерн — вероятно подмножество большего
+                continue
+
+            try:
+                criteria = (
+                    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    30, 0.01,
+                )
+                corners = cv2.cornerSubPix(
+                    base_gray, corners, (11, 11), (-1, -1), criteria,
+                )
+            except Exception:
+                pass
+
+            world = _build_world_grid(
+                cols, rows, square_mm, origin_x, origin_y,
+            )
+            pts: list[CalibrationPoint] = []
+            for i, (wx, wy) in enumerate(world):
+                cx, cy = corners[i, 0]
+                pts.append(CalibrationPoint(
+                    px_x=float(cx), px_y=float(cy),
+                    world_x=float(wx), world_y=float(wy),
+                    label=f"CB{i}",
+                ))
+            return AutoDetectResult(
+                pattern="chessboard",
+                points=pts, cols=cols, rows=rows,
+                image_size=(W, H),
+                notes=(
+                    f"square={square_mm}mm size={cols}x{rows} "
+                    f"pre={label} cov={cov:.0%}"
+                ),
+            )
+    return None
+
+
+def _try_circles(
+    gray: np.ndarray, pattern_size: tuple[int, int], asymmetric: bool,
+) -> np.ndarray | None:
+    """Попытка детектировать сетку кругов заданного размера."""
     flags = (
         cv2.CALIB_CB_ASYMMETRIC_GRID
         if asymmetric
         else cv2.CALIB_CB_SYMMETRIC_GRID
     )
-    found, centers = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
+    try:
+        found, centers = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
+    except Exception:
+        return None
     if not found or centers is None:
         return None
+    return centers
 
-    cols, rows = pattern_size
+
+def _build_circles_points(
+    centers: np.ndarray, cols: int, rows: int, spacing_mm: float,
+    asymmetric: bool, origin_x: float, origin_y: float,
+) -> list[CalibrationPoint]:
+    """Построить CalibrationPoint-ы для найденных центров кругов."""
+    pts: list[CalibrationPoint] = []
     if asymmetric:
-        # Asymmetric grid: каждая чётная строка сдвинута на пол-шага
-        pts: list[CalibrationPoint] = []
         idx = 0
         for r in range(rows):
             for c in range(cols):
@@ -358,7 +557,6 @@ def detect_circles_grid(
                 idx += 1
     else:
         world = _build_world_grid(cols, rows, spacing_mm, origin_x, origin_y)
-        pts = []
         for i, (wx, wy) in enumerate(world):
             cx, cy = centers[i, 0]
             pts.append(CalibrationPoint(
@@ -366,13 +564,106 @@ def detect_circles_grid(
                 world_x=float(wx), world_y=float(wy),
                 label=f"SG{i}",
             ))
+    return pts
 
+
+def detect_circles_grid(
+    frame: np.ndarray,
+    pattern_size: tuple[int, int] = (4, 11),
+    spacing_mm: float = 5.0,
+    *,
+    asymmetric: bool = True,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> AutoDetectResult | None:
+    """Автоопределение сетки кругов с фиксированным pattern_size.
+
+    Поддерживает симметричную и асимметричную раскладку. Использует
+    препроцессинг для повышения шансов на детекцию в реальных условиях.
+    """
+    variants = _preprocess_variants(frame)
+    if not variants:
+        return None
+
+    cols, rows = pattern_size
+    used_label = ""
+    centers = None
+    for label, gray in variants:
+        c = _try_circles(gray, pattern_size, asymmetric)
+        if c is not None:
+            centers = c
+            used_label = label
+            break
+    if centers is None:
+        return None
+
+    base_gray = variants[0][1]
+    pts = _build_circles_points(
+        centers, cols, rows, spacing_mm, asymmetric, origin_x, origin_y,
+    )
     return AutoDetectResult(
         pattern="circles_asymmetric" if asymmetric else "circles_symmetric",
         points=pts, cols=cols, rows=rows,
-        image_size=(gray.shape[1], gray.shape[0]),
-        notes=f"spacing={spacing_mm}mm",
+        image_size=(base_gray.shape[1], base_gray.shape[0]),
+        notes=f"spacing={spacing_mm}mm pre={used_label}",
     )
+
+
+def find_circles_grid_any_size(
+    frame: np.ndarray,
+    spacing_mm: float = 5.0,
+    *,
+    asymmetric: bool = True,
+    candidates: tuple[tuple[int, int], ...] | None = None,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+    progress: Callable[[int, int, str], None] | None = None,
+    min_coverage: float = _MIN_PATTERN_COVERAGE,
+) -> AutoDetectResult | None:
+    """Перебор размеров сетки кругов без указания cols/rows."""
+    variants = _preprocess_variants(frame)
+    if not variants:
+        return None
+
+    base_gray = variants[0][1]
+    H, W = base_gray.shape[:2]
+    if candidates is None:
+        candidates = (
+            _CIRCLES_ASYM_CANDIDATES if asymmetric else _CIRCLES_SYM_CANDIDATES
+        )
+    total = len(candidates)
+    pat_label = "circles_asymmetric" if asymmetric else "circles_symmetric"
+
+    for idx, ps in enumerate(candidates):
+        if progress is not None:
+            try:
+                progress(idx, total, f"{pat_label} {ps[0]}x{ps[1]}")
+            except Exception:
+                pass
+        cols, rows = ps
+        if cols < 2 or rows < 2:
+            continue
+        for label, gray in variants:
+            centers = _try_circles(gray, ps, asymmetric)
+            if centers is None:
+                continue
+            cov = _bbox_coverage(centers, W, H)
+            if cov < min_coverage:
+                continue
+            pts = _build_circles_points(
+                centers, cols, rows, spacing_mm, asymmetric,
+                origin_x, origin_y,
+            )
+            return AutoDetectResult(
+                pattern=pat_label,
+                points=pts, cols=cols, rows=rows,
+                image_size=(W, H),
+                notes=(
+                    f"spacing={spacing_mm}mm size={cols}x{rows} "
+                    f"pre={label} cov={cov:.0%}"
+                ),
+            )
+    return None
 
 
 def detect_aruco_markers(
@@ -448,34 +739,51 @@ def detect_aruco_markers(
 def auto_detect_pattern(
     frame: np.ndarray,
     *,
-    chessboard_size: tuple[int, int] = (9, 6),
-    chessboard_square_mm: float = 5.0,
-    circles_size: tuple[int, int] = (4, 11),
-    circles_spacing_mm: float = 5.0,
-    circles_asymmetric: bool = True,
+    spacing_mm: float = 5.0,
     aruco_world_coords: dict[int, tuple[float, float]] | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> AutoDetectResult | None:
-    """Универсальный автодетектор: пробует все известные паттерны по порядку.
+    """Полностью автоматический детектор без ручного указания cols/rows.
 
-    Порядок: chessboard → asym circles → sym circles → aruco.
-    Возвращает первый успешный результат.
+    Порядок попыток:
+      1. Шахматная доска — все стандартные размеры (от 9×6 до 15×12)
+      2. Асимметричная сетка кругов — все стандартные размеры
+      3. Симметричная сетка кругов — все стандартные размеры
+      4. ArUco-маркеры (если задано соответствие id → mm)
+
+    Для каждого размера применяется набор препроцессингов (CLAHE / инверсия /
+    blur / adaptive threshold), что покрывает плохое освещение и блики.
+
+    Параметр ``spacing_mm`` — единственное, что должен знать оператор:
+    шаг сетки в миллиметрах. Размер паттерна определяется автоматически.
     """
-    res = detect_chessboard(
-        frame, chessboard_size, chessboard_square_mm,
+    def _wrap_progress(stage: str):
+        if progress is None:
+            return None
+        def _cb(idx: int, total: int, label: str) -> None:
+            try:
+                progress(idx, total, f"{stage}: {label}")
+            except Exception:
+                pass
+        return _cb
+
+    res = find_chessboard_any_size(
+        frame, square_mm=spacing_mm,
+        progress=_wrap_progress("шахматная доска"),
     )
     if res is not None:
         return res
 
-    res = detect_circles_grid(
-        frame, circles_size, circles_spacing_mm,
-        asymmetric=True,
+    res = find_circles_grid_any_size(
+        frame, spacing_mm=spacing_mm, asymmetric=True,
+        progress=_wrap_progress("круги (асим.)"),
     )
     if res is not None:
         return res
 
-    res = detect_circles_grid(
-        frame, circles_size, circles_spacing_mm,
-        asymmetric=False,
+    res = find_circles_grid_any_size(
+        frame, spacing_mm=spacing_mm, asymmetric=False,
+        progress=_wrap_progress("круги (сим.)"),
     )
     if res is not None:
         return res
